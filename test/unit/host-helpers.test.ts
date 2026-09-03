@@ -30,6 +30,60 @@ describe("buildProviderUploadMessage", () => {
 });
 
 describe("mapToolToMessage", () => {
+  describe("network commands", () => {
+    it("maps network listings to bounded rich capture with exact origin separate from URL filters", () => {
+      expect(
+        helpers.mapToolToMessage("network", {
+          origin: "https://teams.example.test",
+          filter: "/api/",
+          last: "10",
+          format: "raw",
+        }),
+      ).toMatchObject({
+        type: "READ_NETWORK_REQUESTS",
+        full: true,
+        origin: "https://teams.example.test",
+        urlPattern: "/api/",
+        limit: 10,
+        format: "raw",
+      });
+    });
+
+    it("routes read_network_requests through the validated full-summary mapper", () => {
+      expect(
+        helpers.mapToolToMessage("read_network_requests", {
+          url_pattern: "/api/",
+          limit: "10",
+        }),
+      ).toMatchObject({
+        type: "READ_NETWORK_REQUESTS",
+        full: true,
+        urlPattern: "/api/",
+        limit: 10,
+      });
+      expect(() =>
+        helpers.mapToolToMessage("read_network_requests", { limit: "unbounded" }),
+      ).toThrow("network limit must be an integer between 0 and 500");
+    });
+
+    it("rejects invalid network limits", () => {
+      expect(() => helpers.mapToolToMessage("network", { last: "many" })).toThrow(
+        "network limit must be an integer between 0 and 500",
+      );
+      for (const last of [-1, 1.5, 501]) {
+        expect(() => helpers.mapToolToMessage("network", { last })).toThrow(
+          "network limit must be an integer between 0 and 500",
+        );
+      }
+    });
+
+    it("rejects unbounded network format metadata", () => {
+      expect(() => helpers.mapToolToMessage("network", { format: "x".repeat(4_096) })).toThrow(
+        "network format must be compact, urls, curl, raw, or verbose",
+      );
+    });
+  });
+
   describe("window commands", () => {
     it("maps window.new to WINDOW_NEW with url", () => {
       const msg = helpers.mapToolToMessage("window.new", { url: "https://example.com" });
@@ -528,6 +582,80 @@ describe("formatToolContent", () => {
         atBottom: false,
         scrollPercentage: 35,
       });
+    });
+  });
+
+  describe("network responses", () => {
+    it("preserves raw metadata when no entries are returned", () => {
+      const result = helpers.formatToolContent({
+        entries: [],
+        totalEntries: 7,
+        returnedEntries: 0,
+        truncated: true,
+        maxBytes: 30 * 1024,
+        format: "raw",
+      });
+
+      expect(JSON.parse(result[0].text)).toMatchObject({
+        entries: [],
+        totalEntries: 7,
+        returnedEntries: 0,
+        truncated: true,
+        maxBytes: 30 * 1024,
+        _format: "raw",
+      });
+    });
+
+    it("preserves counts in every nonempty human format", () => {
+      for (const format of ["urls", "curl", "verbose"]) {
+        const result = helpers.formatToolContent({
+          entries: [
+            {
+              id: "r_failed",
+              method: "GET",
+              status: 0,
+              type: "XHR",
+              url: "https://example.test/api?token=%3Credacted%3E",
+              flags: ["failed"],
+              failureReason: "net::ERR_FAILED",
+            },
+          ],
+          totalEntries: 4,
+          returnedEntries: 1,
+          truncated: true,
+          format,
+        });
+
+        expect(result[0].text).toContain("Count: total=4, returned=1, truncated=true");
+        if (format === "verbose") {
+          expect(result[0].text).toContain("Status: FAILED");
+          expect(result[0].text).toContain("Failure: net::ERR_FAILED");
+          expect(result[0].text).not.toContain("Status: pending");
+        }
+      }
+    });
+
+    it("uses the compact output contract with honest counts", () => {
+      const result = helpers.formatToolContent({
+        entries: [
+          {
+            id: "r_failed",
+            method: "GET",
+            status: 0,
+            type: "XHR",
+            url: "https://example.test/api?token=%3Credacted%3E",
+            flags: ["failed"],
+            failureReason: "net::ERR_FAILED",
+          },
+        ],
+        totalEntries: 4,
+        returnedEntries: 1,
+        truncated: true,
+      });
+
+      expect(result[0].text).toContain("FAIL");
+      expect(result[0].text).toContain("net::ERR_FAILED");
+      expect(result[0].text).toContain("Showing: 1 of 4 requests");
     });
   });
 

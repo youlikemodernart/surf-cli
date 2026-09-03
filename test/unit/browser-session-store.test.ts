@@ -147,6 +147,35 @@ describe("BrowserSessionStore", () => {
     expect(sessions.getNamedTab(identity, "dashboard")).toBeNull();
   });
 
+  it("CAS-removes only the complete original identity including ownership", () => {
+    const { store: sessions } = store();
+    const created = sessions.create(identity, "task", {
+      tabId: 44,
+      windowId: 5,
+      ownership: "surf-created",
+    });
+
+    for (const patch of [
+      { bindingId: "replacement" },
+      { browserInstanceId: "browser-b" },
+      { browserEpoch: "epoch-b" },
+      { tabId: 45 },
+      { ownership: "adopted" },
+    ]) {
+      expect(sessions.compareAndRemove(identity, "task", { ...created, ...patch })).toMatchObject({
+        outcome: "mismatch",
+      });
+      expect(sessions.get(identity, "task")).toMatchObject({ bindingId: created.bindingId });
+    }
+
+    expect(sessions.compareAndRemove(identity, "task", created)).toMatchObject({
+      outcome: "removed",
+    });
+    expect(sessions.compareAndRemove(identity, "task", created)).toMatchObject({
+      outcome: "absent",
+    });
+  });
+
   it("fails closed on malformed private state", () => {
     const { root, store: sessions } = store();
     writeFileSync(join(root, "browser-sessions.json"), "{not-json", { mode: 0o600 });

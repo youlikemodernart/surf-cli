@@ -852,6 +852,7 @@ async function prepareToolRequest(msg, request) {
   const classification = classifyTool(request.tool, args);
   request.scope = classification.scope;
   request.classification = classification;
+  request.admissionWait = msg.admission?.wait !== false;
   request.resourceKeys = classification.resourceKeys || [];
   const { identity, target } = await resolveRequestTarget(msg, request, classification);
   request.browserIdentity = identity;
@@ -1066,8 +1067,15 @@ async function cleanupBrowserSessions(identity, request, args) {
 }
 
 async function createSessionBinding(request, identity, name, args, previous = null) {
-  const mode = args.tab === true ? "tab" : args.window === true ? "window" : previous?.mode || "window";
-  if (args.tab === true && args.window === true) {
+  const taskOwnedBackground = args["task-owned"] === true;
+  const mode = taskOwnedBackground
+    ? "window"
+    : args.tab === true
+      ? "tab"
+      : args.window === true
+        ? "window"
+        : previous?.mode || "window";
+  if (!taskOwnedBackground && args.tab === true && args.window === true) {
     throw surfError("session_mode_ambiguous", "Use either --window or --tab, not both.", { session: name });
   }
   const url = args.url || previous?.lastUrl || "about:blank";
@@ -1076,7 +1084,7 @@ async function createSessionBinding(request, identity, name, args, previous = nu
     name,
     url,
     mode,
-    focused: args.focused === true,
+    focused: taskOwnedBackground ? false : args.focused === true,
     windowId: mode === "tab" ? positiveId(args.windowId ?? args["window-id"], "windowId") : undefined,
   });
   try {
@@ -1086,6 +1094,7 @@ async function createSessionBinding(request, identity, name, args, previous = nu
       browserEpoch: identity.browserEpoch,
       mode,
       ownership: "surf-created",
+      taskOwnedBackground,
       lastAccessedAt: new Date().toISOString(),
       lastUrl: created.url || url,
       lastTitle: created.title,
@@ -1106,7 +1115,154 @@ async function createSessionBinding(request, identity, name, args, previous = nu
   }
 }
 
+function releaseOriginalIdentity(args) {
+  const original = {
+    name: args.name,
+    bindingId: args.bindingId ?? args["binding-id"],
+    browserInstanceId: args.browserInstanceId ?? args["browser-instance-id"],
+    browserEpoch: args.browserEpoch ?? args["browser-epoch"],
+    tabId: positiveId(args.tabId ?? args["tab-id"] ?? args.expectedTabId ?? args["expected-tab-id"], "tabId"),
+    ownership: args.ownership,
+  };
+  validateSessionName(original.name);
+  for (const field of ["bindingId", "browserInstanceId", "browserEpoch"]) {
+    if (typeof original[field] !== "string" || !original[field] || original[field].length > 128) {
+      throw surfError("release_identity_invalid", `session.release requires exact ${field}`);
+    }
+  }
+  if (!original.tabId || !["surf-created", "adopted"].includes(original.ownership)) {
+    throw surfError("release_identity_invalid", "session.release requires exact tabId and ownership");
+  }
+  return original;
+}
+
+function releaseIdentityMatches(record, original) {
+  return ["bindingId", "browserInstanceId", "browserEpoch", "tabId", "ownership"]
+    .every((field) => record?.[field] === original[field]);
+}
+
+function isAuthoritativeTabGone(error, tabId) {
+  return error?.code === "tab_gone" && Number.isInteger(error?.tabId) && error.tabId === tabId;
+}
+
+async function releaseBrowserSession(args, request) {
+  const currentIdentity = await requireBrowserIdentity();
+  const original = releaseOriginalIdentity(args);
+  if (currentIdentity.browserInstanceId !== original.browserInstanceId || currentIdentity.browserEpoch !== original.browserEpoch) {
+    return { outcome: "retained", name: original.name, targetClosed: false, blocker: "browser_identity_changed" };
+  }
+  const identity = { browserInstanceId: original.browserInstanceId, browserEpoch: original.browserEpoch };
+  const laneKey = targetLaneKey(identity, original.tabId);
+  let admission;
+  try {
+    admission = await browserScheduler.acquire({
+      scope: "browser-write",
+      laneKey,
+      session: original.name,
+      wait: request.admissionWait !== false && args["no-wait"] !== true,
+      signal: request.signal,
+      request,
+    });
+  } catch (error) {
+    if (["browser_busy", "tab_busy", "resource_busy", "queue_timeout"].includes(error?.code)) {
+      return { outcome: "retained", name: original.name, tabId: original.tabId, targetClosed: false, blocker: "browser_busy" };
+    }
+    throw error;
+  }
+
+  try {
+    let record = browserSessionStore.get(identity, original.name);
+    if (!record) {
+      try {
+        await inspectBrowserTab(request, original.tabId);
+        return { outcome: "retained", name: original.name, tabId: original.tabId, targetClosed: false, blocker: "target_present_without_binding" };
+      } catch (error) {
+        if (isAuthoritativeTabGone(error, original.tabId)) {
+          return { outcome: "already_absent", name: original.name, tabId: original.tabId, targetClosed: false };
+        }
+        return { outcome: "retained", name: original.name, tabId: original.tabId, targetClosed: false, blocker: "target_state_unknown" };
+      }
+    }
+    if (!releaseIdentityMatches(record, original)) {
+      return { outcome: "retained", name: original.name, tabId: record.tabId, targetClosed: false, blocker: "binding_changed" };
+    }
+
+    let inspected;
+    let targetAbsent = false;
+    try {
+      inspected = await inspectBrowserTab(request, original.tabId);
+    } catch (error) {
+      if (!isAuthoritativeTabGone(error, original.tabId)) {
+        return { outcome: "retained", name: original.name, tabId: original.tabId, targetClosed: false, blocker: "target_state_unknown" };
+      }
+      targetAbsent = true;
+    }
+    record = browserSessionStore.get(identity, original.name);
+    if (!record || !releaseIdentityMatches(record, original)) {
+      return { outcome: "retained", name: original.name, tabId: original.tabId, targetClosed: false, blocker: "binding_changed" };
+    }
+    if (
+      inspected &&
+      (!Number.isInteger(inspected.tabId) ||
+        inspected.tabId <= 0 ||
+        inspected.tabId !== original.tabId ||
+        !Number.isInteger(inspected.windowId) ||
+        inspected.windowId <= 0 ||
+        (record.windowId && inspected.windowId !== record.windowId))
+    ) {
+      return { outcome: "retained", name: original.name, tabId: original.tabId, targetClosed: false, blocker: "target_identity_changed" };
+    }
+
+    if (record.ownership === "surf-created" && inspected) {
+      // Re-read immediately before the irreversible close.
+      const beforeClose = browserSessionStore.get(identity, original.name);
+      if (!releaseIdentityMatches(beforeClose, original)) {
+        return { outcome: "retained", name: original.name, tabId: original.tabId, targetClosed: false, blocker: "binding_changed" };
+      }
+      try {
+        await requestExtensionOrThrow(request, "session.release", {
+          type: "SESSION_CLOSE_TARGET",
+          tabId: original.tabId,
+        }, 30000, true);
+      } catch (error) {
+        if (!isAuthoritativeTabGone(error, original.tabId)) {
+          return { outcome: "retained", name: original.name, tabId: original.tabId, targetClosed: false, blocker: "close_outcome_uncertain" };
+        }
+      }
+      try {
+        await inspectBrowserTab(request, original.tabId);
+        return { outcome: "retained", name: original.name, tabId: original.tabId, targetClosed: false, blocker: "target_still_present" };
+      } catch (error) {
+        if (!isAuthoritativeTabGone(error, original.tabId)) {
+          return { outcome: "retained", name: original.name, tabId: original.tabId, targetClosed: false, blocker: "target_state_unknown" };
+        }
+      }
+    }
+
+    // Re-read immediately before removing the binding. Adopted targets remain open.
+    const beforeUnbind = browserSessionStore.get(identity, original.name);
+    if (!releaseIdentityMatches(beforeUnbind, original)) {
+      return { outcome: "retained", name: original.name, tabId: original.tabId, targetClosed: false, blocker: "binding_changed" };
+    }
+    const removal = browserSessionStore.compareAndRemove(identity, original.name, original);
+    if (removal.outcome !== "removed") {
+      return { outcome: "retained", name: original.name, tabId: original.tabId, targetClosed: false, blocker: "binding_changed" };
+    }
+    return {
+      outcome: targetAbsent ? "already_absent" : "released",
+      name: original.name,
+      tabId: original.tabId,
+      ownership: original.ownership,
+      targetClosed: original.ownership === "surf-created" && !targetAbsent,
+      adoptedTargetKept: original.ownership === "adopted",
+    };
+  } finally {
+    admission.release();
+  }
+}
+
 async function handleBrowserSessionCommand(tool, args, request) {
+  if (tool === "session.release") return releaseBrowserSession(args, request);
   const identity = await requireBrowserIdentity();
   const name = args.name;
   if (tool !== "session.list" && tool !== "session.cleanup") validateSessionName(name);
@@ -1127,6 +1283,14 @@ async function handleBrowserSessionCommand(tool, args, request) {
     if (!existing) {
       const record = await createSessionBinding(request, identity, name, args);
       return { session: await sessionRecordStatus(identity, request, record, false), created: true };
+    }
+    if (
+      args["task-owned"] === true &&
+      (existing.ownership !== "surf-created" || existing.mode !== "window" || existing.taskOwnedBackground !== true)
+    ) {
+      throw surfError("session_not_task_owned", `Session is not a task-owned background window: ${name}`, {
+        session: name,
+      });
     }
     if (existing.browserEpoch === identity.browserEpoch && !existing.invalidReason) {
       try {

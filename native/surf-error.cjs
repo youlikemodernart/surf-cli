@@ -3,7 +3,10 @@ class SurfError extends Error {
     super(message);
     this.name = "SurfError";
     this.code = code;
-    Object.assign(this, details);
+    const reserved = new Set(["name", "message", "code", "stack", "__proto__", "prototype", "constructor"]);
+    for (const [key, value] of Object.entries(details)) {
+      if (!reserved.has(key)) this[key] = value;
+    }
   }
 
   toJSON() {

@@ -4,6 +4,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const {
+  default: surfExtension,
   createOracleExternalJobProvider,
   createToolRequest,
   emitOracleFinished,
@@ -12,6 +13,9 @@ const {
   registerOptionalBackgroundProvider,
   registerOptionalExternalJobProvider,
   rememberOracleJobForSession,
+  mapSessionEnsureArgs,
+  mapSessionReleaseArgs,
+  projectSessionEnsureResult,
   resolveBackgroundWorkRegister,
   resolveExternalJobProviderRegister,
   resultFromHost,
@@ -33,6 +37,99 @@ describe("Pi extension", () => {
     expect(agent).toContain("provider: surf-oracle");
     expect(agent).toContain("model: gpt-5.6-sol");
     expect(agent).toContain("effort: pro");
+  });
+
+  it("registers dedicated Pi session lifecycle tools", () => {
+    const names: string[] = [];
+    const handlers: Record<string, (...args: unknown[]) => unknown> = {};
+    surfExtension({
+      registerTool(tool: { name: string }) {
+        names.push(tool.name);
+      },
+      on(event: string, handler: (...args: unknown[]) => unknown) {
+        handlers[event] = handler;
+      },
+    });
+    expect(names).toContain("surf_session_ensure");
+    expect(names).toContain("surf_session_release");
+    expect(handlers).toHaveProperty("session_start");
+    expect(handlers).toHaveProperty("session_shutdown");
+  });
+
+  it("maps Pi session lifecycle adapters to one host contract", () => {
+    expect(
+      mapSessionEnsureArgs({ name: "task", url: "about:blank", focused: true, windowId: 7 }),
+    ).toEqual([
+      "session.ensure",
+      { name: "task", url: "about:blank", window: true, focused: false, "task-owned": true },
+      undefined,
+    ]);
+    expect(
+      mapSessionReleaseArgs({
+        name: "task",
+        bindingId: "binding",
+        browserInstanceId: "browser",
+        browserEpoch: "epoch",
+        tabId: 42,
+        ownership: "surf-created",
+      }),
+    ).toEqual([
+      "session.release",
+      expect.objectContaining({
+        name: "task",
+        "binding-id": "binding",
+        "browser-instance-id": "browser",
+        "browser-epoch": "epoch",
+        "expected-tab-id": 42,
+        ownership: "surf-created",
+      }),
+      undefined,
+    ]);
+  });
+
+  it("projects task-owned session results to the exact release identity only", () => {
+    const result = projectSessionEnsureResult({
+      content: [{ type: "text", text: "unprojected private metadata" }],
+      details: {
+        created: true,
+        session: {
+          name: "task",
+          bindingId: "binding",
+          browserInstanceId: "browser",
+          browserEpoch: "epoch",
+          tabId: 42,
+          ownership: "surf-created",
+          lastUrl: "https://example.test/reset/private-token",
+          lastTitle: "Private account",
+          profile: "user-profile",
+        },
+      },
+    });
+    const serialized = JSON.stringify(result);
+    expect(result.details).toEqual({
+      name: "task",
+      bindingId: "binding",
+      browserInstanceId: "browser",
+      browserEpoch: "epoch",
+      tabId: 42,
+      ownership: "surf-created",
+      created: true,
+      reopened: false,
+    });
+    expect(serialized).not.toContain("private-token");
+    expect(serialized).not.toContain("Private account");
+    expect(serialized).not.toContain("user-profile");
+  });
+
+  it("fails closed when ensure does not return a task-owned identity receipt", () => {
+    const result = projectSessionEnsureResult({
+      content: [{ type: "text", text: "private" }],
+      details: {
+        session: { name: "task", ownership: "adopted", lastUrl: "https://example.test/private" },
+      },
+    });
+    expect(result.isError).toBe(true);
+    expect(JSON.stringify(result)).not.toContain("example.test/private");
   });
 
   it("maps browser tools to the native host request frame", () => {

@@ -334,6 +334,18 @@ const TOOLS = {
           "close-target": "Close an adopted target too",
         },
       },
+      "session.release": {
+        desc: "Release one session using its original exact identity receipt",
+        args: ["name"],
+        opts: {
+          "binding-id": "Original binding ID",
+          "browser-instance-id": "Original browser instance ID",
+          "browser-epoch": "Original browser epoch",
+          "expected-tab-id": "Original tab ID",
+          ownership: "Original ownership: surf-created or adopted",
+          "no-wait": "Return retained instead of waiting for browser admission",
+        },
+      },
       "session.rebind": {
         desc: "Bind a stale or gone session to an explicit existing tab",
         args: ["name"],
@@ -1569,7 +1581,7 @@ Exclude text content:
 };
 
 const ALL_SOCKET_TOOLS = [
-  "session.new", "session.ensure", "session.list", "session.cleanup", "session.info", "session.close", "session.rebind", "session.reopen",
+  "session.new", "session.ensure", "session.list", "session.cleanup", "session.info", "session.close", "session.release", "session.rebind", "session.reopen",
   "ai", "screenshot", "record", "animate-audit", "perf-audit", "navigate",
   "form_input", "find_and_type", "autocomplete", "set_value", "smart_type",
   "scroll_to_position", "get_scroll_info", "close_dialogs", "page_state",
@@ -2699,6 +2711,7 @@ if (tool === "session" && firstArg) {
     cleanup: "session.cleanup",
     info: "session.info",
     close: "session.close",
+    release: "session.release",
     rebind: "session.rebind",
     reopen: "session.reopen",
   };
@@ -2829,6 +2842,7 @@ const PRIMARY_ARG_MAP = {
   "session.ensure": "name",
   "session.info": "name",
   "session.close": "name",
+  "session.release": "name",
   "session.rebind": "name",
   "session.reopen": "name",
   "locate.role": "role",
@@ -3657,6 +3671,8 @@ async function handleResponse(response) {
     console.log(`Use: export SURF_SESSION=${entry.name}`);
   } else if (finalTool === "session.close" && data?.success) {
     console.log(`Session ${data.name} closed (${data.targetClosed ? "target closed" : "target kept"})`);
+  } else if (finalTool === "session.release" && data?.outcome) {
+    console.log(JSON.stringify(data, null, 2));
   } else if (tool === "screenshot" && data?.base64 && (outputPath || toolArgs.savePath)) {
     const saveTo = transferPlan.downloads?.[0]?.destination || toolArgs.savePath || outputPath;
     fs.writeFileSync(saveTo, Buffer.from(data.base64, "base64"));
@@ -3782,20 +3798,28 @@ async function handleResponse(response) {
     // Network list - handle both new (entries) and old (requests) formats
     const items = data.entries || data.requests || [];
 
-    if (items.length === 0) {
-      console.log("No network requests captured");
-    } else if (data._format === 'raw') {
-      // Raw JSON output - print entries array directly
-      console.log(JSON.stringify(items, null, 2));
+    if (data._format === 'raw') {
+      console.log(JSON.stringify({
+        entries: items,
+        totalEntries: data.totalEntries ?? items.length,
+        returnedEntries: data.returnedEntries ?? items.length,
+        truncated: data.truncated === true,
+        maxBytes: data.maxBytes,
+      }, null, 2));
+    } else if (items.length === 0) {
+      const total = data.totalEntries ?? 0;
+      console.log(total > 0 ? `Showing: 0 of ${total} requests` : "No network requests captured");
+    } else if (data.format === 'urls' || data.format === 'curl' || data.format === 'verbose' || data.verbose > 0) {
+      let formatted;
+      if (data.format === 'urls') formatted = networkFormatters.formatUrls(items);
+      else if (data.format === 'curl') formatted = networkFormatters.formatCurlBatch(items);
+      else formatted = networkFormatters.formatVerbose(items, data.verbose || 1);
+      console.log(`${formatted}\n\n${networkFormatters.formatResultCount(items, data)}`);
     } else {
-      // Simple compact format for now
-      for (const req of items) {
-        const status = req.status || '-';
-        const method = (req.method || 'GET').padEnd(6);
-        const type = (req.type || '').padEnd(10);
-        const url = req.url || '';
-        console.log(`${status} ${method} ${type} ${url}`);
-      }
+      console.log(networkFormatters.formatCompact(items, {
+        totalEntries: data.totalEntries,
+        truncated: data.truncated,
+      }));
     }
   } else if (tool === "network.get" && data?.entry) {
     console.log(networkFormatters.formatEntry(data.entry));

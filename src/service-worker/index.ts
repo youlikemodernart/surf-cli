@@ -1,4 +1,9 @@
 import { CDPController } from "../cdp/controller";
+import {
+  matchesNetworkOrigin,
+  matchesNetworkStatus,
+  summarizeNetworkEntries,
+} from "../cdp/network-summary";
 import { debugLog } from "../utils/debug";
 import { initNativeMessaging, postToNativeHost } from "../native/port-manager";
 
@@ -6,6 +11,24 @@ debugLog("Service worker loaded");
 
 const cdp = new CDPController();
 const activeStreamTabs = new Map<number, number>();
+const NETWORK_LIST_FORMATS = new Set(["compact", "urls", "curl", "raw", "verbose"]);
+
+function normalizeNetworkListFormat(value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string" || !NETWORK_LIST_FORMATS.has(value)) {
+    throw new Error("network format must be compact, urls, curl, raw, or verbose");
+  }
+  return value;
+}
+
+function normalizeNetworkVerbose(value: unknown): number {
+  if (value === undefined) return 0;
+  const verbose = Number(value);
+  if (!Number.isInteger(verbose) || verbose < 0 || verbose > 2) {
+    throw new Error("network verbose level must be 0, 1, or 2");
+  }
+  return verbose;
+}
 
 function getFrameIdForTab(_tabId: number, message?: { frameId?: unknown }): number {
   const frameId = Number(message?.frameId);
@@ -48,6 +71,36 @@ class BrowserCommandError extends Error {
   }
 }
 
+function isConfirmedMissingTabError(error: unknown, tabId: number): boolean {
+  if (typeof error === "object" && error !== null && "code" in error) return false;
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  return new RegExp(`^No tab with id: ${tabId}\\.?$`).test(message);
+}
+
+function validateInspectedTabIdentity(tab: chrome.tabs.Tab, tabId: number): void {
+  if (
+    !Number.isInteger(tab.id) ||
+    tab.id! <= 0 ||
+    tab.id !== tabId ||
+    !Number.isInteger(tab.windowId) ||
+    tab.windowId <= 0
+  ) {
+    throw new BrowserCommandError("target_inspection_failed", `Tab ${tabId} returned mismatched or malformed identity`, {
+      tabId,
+    });
+  }
+}
+
+function tabInspectionError(error: unknown, tabId: number): BrowserCommandError {
+  if (isConfirmedMissingTabError(error, tabId)) {
+    return new BrowserCommandError("tab_gone", `Tab ${tabId} no longer exists`, { tabId });
+  }
+  return new BrowserCommandError("target_inspection_failed", `Could not verify whether tab ${tabId} exists`, {
+    tabId,
+    cause: error instanceof Error ? error.message : String(error ?? "unknown error"),
+  });
+}
+
 async function inspectTarget(tabId: number): Promise<{
   tabId: number;
   windowId: number;
@@ -61,14 +114,12 @@ async function inspectTarget(tabId: number): Promise<{
   let tab: chrome.tabs.Tab;
   try {
     tab = await chrome.tabs.get(tabId);
-  } catch {
-    throw new BrowserCommandError("tab_gone", `Tab ${tabId} no longer exists`, { tabId });
+  } catch (error) {
+    throw tabInspectionError(error, tabId);
   }
-  if (!tab.id || tab.windowId === undefined) {
-    throw new BrowserCommandError("tab_gone", `Tab ${tabId} no longer has a browser window`, { tabId });
-  }
+  validateInspectedTabIdentity(tab, tabId);
   return {
-    tabId: tab.id,
+    tabId,
     windowId: tab.windowId,
     url: tab.url,
     title: tab.title,
@@ -736,8 +787,14 @@ export async function handleMessage(
       }
       try {
         await chrome.tabs.remove(targetTabId);
-      } catch {
-        return { success: true, tabId: targetTabId, alreadyGone: true };
+      } catch (error) {
+        if (isConfirmedMissingTabError(error, targetTabId)) {
+          return { success: true, tabId: targetTabId, alreadyGone: true };
+        }
+        throw new BrowserCommandError("target_close_failed", `Could not confirm closure of tab ${targetTabId}`, {
+          tabId: targetTabId,
+          cause: error instanceof Error ? error.message : String(error ?? "unknown error"),
+        });
       }
       return { success: true, tabId: targetTabId };
     }
@@ -2629,60 +2686,46 @@ export async function handleMessage(
       } catch (e) {}
       await cdp.drainNetworkEvents(tabId);
 
-      // If full flag is passed, use getNetworkEntries for rich data
-      if (message.full) {
-        let entries = cdp.getNetworkEntries(tabId, {
-          urlPattern: message.urlPattern,
-        });
-
-        // Apply filters
-        if (message.method) {
-          entries = entries.filter(e => e.method === message.method);
-        }
-        if (message.status) {
-          entries = entries.filter(e => e.status === message.status);
-        }
-        if (message.contentType) {
-          entries = entries.filter(e => e.type === message.contentType);
-        }
-
-        if (message.clear) {
-          cdp.clearNetworkRequests(tabId);
-        }
-
-        // Return entries sliced to limit
-        const limit = message.limit || 100;
-        return {
-          entries: entries.slice(0, limit),
-          format: message.format,
-          verbose: message.verbose
-        };
-      }
-
-      let requests = cdp.getNetworkRequests(tabId, {
+      // Every listing path uses the same rich-entry summary. The legacy
+      // NetworkRequest branch exposed raw URLs, headers, and bodies when a
+      // caller omitted `full`, so `full` is intentionally no longer a gate.
+      let entries = cdp.getNetworkEntries(tabId, {
         urlPattern: message.urlPattern,
-        limit: message.limit || 100,
       });
 
-      // Apply filters
-      if (message.method) {
-        requests = requests.filter(r => r.method === message.method);
+      // Apply filters before summarizing so output bounds are spent only on
+      // relevant requests.
+      if (message.origin) {
+        entries = entries.filter(e => matchesNetworkOrigin(e.origin, message.origin));
       }
-      if (message.status) {
-        requests = requests.filter(r => r.status === message.status);
+      if (message.method) {
+        entries = entries.filter(e => e.method === String(message.method).toUpperCase());
+      }
+      if (message.status !== undefined) {
+        entries = entries.filter((entry) => matchesNetworkStatus(entry.status, message.status));
       }
       if (message.contentType) {
-        requests = requests.filter(r => r.type === message.contentType);
+        const expectedType = String(message.contentType).toLowerCase();
+        entries = entries.filter(e => (e.mimeType || e.type || "").toLowerCase().includes(expectedType));
       }
 
       if (message.clear) {
         cdp.clearNetworkRequests(tabId);
       }
 
+      // Network listings cross the native messaging boundary. Return only a
+      // bounded, redacted summary; detailed bodies remain explicit via
+      // network.body and exports.
+      const limit = message.limit ?? 100;
+      const format = normalizeNetworkListFormat(message.format);
+      const verbose = normalizeNetworkVerbose(message.verbose);
+      // Reserve 2 KiB for the validated response envelope so the complete
+      // native message remains below the 32 KiB listing contract.
+      const summary = summarizeNetworkEntries(entries, { maxBytes: 30 * 1024, maxEntries: limit });
       return {
-        requests,
-        format: message.format,
-        verbose: message.verbose
+        ...summary,
+        format,
+        verbose,
       };
     }
 
@@ -3977,11 +4020,13 @@ initNativeMessaging(async (msg) => {
   let autoCreatedTab = false;
 
   if (tabId && !isDialogCommand && !COMMANDS_WITHOUT_TAB.has(msg.type)) {
+    let tab: chrome.tabs.Tab;
     try {
-      await chrome.tabs.get(tabId);
-    } catch {
-      throw new BrowserCommandError("tab_gone", `Tab ${tabId} no longer exists`, { tabId });
+      tab = await chrome.tabs.get(tabId);
+    } catch (error) {
+      throw tabInspectionError(error, tabId);
     }
+    validateInspectedTabIdentity(tab, tabId);
   } else if (!tabId && needsTab) {
     if (msg.strictTarget) {
       throw new BrowserCommandError("target_required", "Strict browser command requires an explicit tab binding");

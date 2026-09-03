@@ -1002,6 +1002,63 @@ describe("CDPController", () => {
         reason: "disabled",
       });
     });
+
+    it("retains exactly the newest 500 network entries", async () => {
+      await controller.enableNetworkTracking(tabId, { bodyMode: "none" });
+      const dispatch = (method: string, params: Record<string, unknown>) =>
+        (
+          controller as unknown as {
+            handleCDPEvent: (tab: number, event: string, value: unknown) => Promise<void> | void;
+          }
+        ).handleCDPEvent(tabId, method, params);
+
+      for (let index = 0; index < 502; index += 1) {
+        await dispatch("Network.requestWillBeSent", {
+          requestId: `request-${index}`,
+          timestamp: index + 1,
+          request: { url: `https://example.test/${index}`, method: "GET", headers: {} },
+        });
+      }
+
+      const entries = controller.getNetworkEntries(tabId, { includeStatic: true });
+      expect(entries).toHaveLength(500);
+      expect(entries[0].url).toBe("https://example.test/2");
+      expect(entries.at(-1)?.url).toBe("https://example.test/501");
+    });
+
+    it("retains loading failure details for bounded network summaries", async () => {
+      await controller.enableNetworkTracking(tabId, { bodyMode: "none" });
+      const dispatch = (method: string, params: Record<string, unknown>) =>
+        (
+          controller as unknown as {
+            handleCDPEvent: (tab: number, event: string, value: unknown) => Promise<void> | void;
+          }
+        ).handleCDPEvent(tabId, method, params);
+
+      await dispatch("Network.requestWillBeSent", {
+        requestId: "failed-request",
+        timestamp: 1,
+        request: { url: "https://example.test/api", method: "GET", headers: {} },
+      });
+      await dispatch("Network.loadingFailed", {
+        requestId: "failed-request",
+        timestamp: 1.02,
+        errorText: "net::ERR_CONNECTION_RESET",
+        canceled: false,
+        blockedReason: "other",
+        corsErrorStatus: { corsError: "DisallowedByMode" },
+      });
+
+      expect(controller.getNetworkEntries(tabId)[0]).toMatchObject({
+        status: 0,
+        flags: ["failed"],
+        failureReason: "net::ERR_CONNECTION_RESET",
+        canceled: false,
+        blockedReason: "other",
+        corsErrorStatus: { corsError: "DisallowedByMode" },
+        bodyCapture: { mode: "none", complete: false, reason: "request-failed" },
+      });
+    });
   });
 
   describe("handleDialog", () => {

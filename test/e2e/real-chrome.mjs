@@ -20,8 +20,6 @@ import { promisify } from "node:util";
 const execFileAsync = promisify(execFile);
 const require = createRequire(import.meta.url);
 const repo = process.cwd();
-const extensionKey =
-  "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArWZVsRzpoyzuyQFqRzGOnkxv9FNaX/SR/VMw2f9ld+DKmUMxJhi/14olehkLWRJQumFPYTzWr1oqb1LwwI2KhBtn9mbaqzPSrrRGQ1VobTx7ZmxU+ooppXNdb2KGh/WXVqahS0D1nsQplAE6hCqQWPjsPCnXnWjUIH/B0EsInIUDwA8PKfuMG8p2HDlLj8hEpmLwOA48W4aHbl2S6bZHu9O50Lbd0L94aSwJLBNLKuXpBt/kFwlnpHd3zoJme9DIbqnDU/nMNh9SlA+EXRT6FhyiKdo6ZBMdtJeUPLQI2uHeoF8wikkNhIXX/E2EXlBqtZJJaFEi895x2s40+j/iZQIDAQAB"; // gitleaks:allow -- public test manifest key
 const extensionId = "nionemkjcnknfdhdolfloigkhpjnifmf";
 const pinnedChromeVersion = "152.0.7977.54";
 const scratch = mkdtempSync(join(tmpdir(), "surf-real-chrome-"));
@@ -38,6 +36,12 @@ let chromeExecutablePath;
 let puppeteer;
 let server;
 let failure;
+const landmarks = {
+  browser: false,
+  keyedServiceWorker: false,
+  nativeSocket: false,
+  wrapperHostPid: false,
+};
 
 function extensionIdForKey(key) {
   const digest = createHash("sha256").update(Buffer.from(key, "base64")).digest().subarray(0, 16);
@@ -155,17 +159,14 @@ try {
     );
   }
 
-  if (extensionIdForKey(extensionKey) !== extensionId) {
-    throw new Error("Stable extension key does not match the expected test extension ID");
-  }
-
   mkdirSync(home, { recursive: true });
   mkdirSync(surfTmp, { recursive: true });
   cpSync(join(repo, "dist"), extensionDir, { recursive: true });
   const extensionManifestPath = join(extensionDir, "manifest.json");
   const extensionManifest = JSON.parse(readFileSync(extensionManifestPath, "utf8"));
-  extensionManifest.key = extensionKey;
-  writeFileSync(extensionManifestPath, `${JSON.stringify(extensionManifest, null, 2)}\n`);
+  if (!extensionManifest.key || extensionIdForKey(extensionManifest.key) !== extensionId) {
+    throw new Error("Built manifest key does not derive the expected stable extension ID");
+  }
 
   await execFileAsync(
     process.execPath,
@@ -230,6 +231,7 @@ try {
     args: process.platform === "linux" ? ["--no-sandbox"] : [],
   });
   browserPid = browser.process()?.pid;
+  landmarks.browser = Boolean(browserPid);
 
   const workerTarget = await browser.waitForTarget(
     (target) =>
@@ -237,8 +239,11 @@ try {
       target.url().startsWith(`chrome-extension://${extensionId}/`),
     { timeout: 20_000 },
   );
+  landmarks.keyedServiceWorker = true;
   await waitFor(() => existsSync(socketPath), "Surf native-host socket");
+  landmarks.nativeSocket = true;
   await waitFor(() => existsSync(hostPidPath), "Surf native-host PID");
+  landmarks.wrapperHostPid = true;
 
   await runSurf("tab.new", fixtureUrl, "--json");
   await runSurf("go", navigationUrl, "--no-screenshot", "--json");
@@ -372,6 +377,56 @@ try {
     "visual indicator removal",
   );
 
+  const releaseArgs = (session) => [
+    "--binding-id", session.bindingId,
+    "--browser-instance-id", session.browserInstanceId,
+    "--browser-epoch", session.browserEpoch,
+    "--expected-tab-id", String(session.tabId),
+    "--ownership", session.ownership,
+    "--json",
+  ];
+  const ensured = JSON.parse(await runSurf("session.ensure", "real-chrome-release", "about:blank", "--tab", "--json"));
+  const original = ensured.session;
+  for (const field of ["bindingId", "browserInstanceId", "browserEpoch", "tabId", "ownership"]) {
+    if (original?.[field] === undefined) throw new Error(`session.ensure omitted ${field}`);
+  }
+  const stale = JSON.parse(await runSurf(
+    "session.release", "real-chrome-release", "--binding-id", `${original.bindingId}-stale`,
+    "--browser-instance-id", original.browserInstanceId, "--browser-epoch", original.browserEpoch,
+    "--expected-tab-id", String(original.tabId), "--ownership", original.ownership, "--json",
+  ));
+  if (stale.outcome !== "retained") throw new Error(`stale release was not retained: ${JSON.stringify(stale)}`);
+  const released = JSON.parse(await runSurf("session.release", "real-chrome-release", ...releaseArgs(original)));
+  if (released.outcome !== "released" || released.targetClosed !== true) {
+    throw new Error(`exact release failed: ${JSON.stringify(released)}`);
+  }
+  const repeated = JSON.parse(await runSurf("session.release", "real-chrome-release", ...releaseArgs(original)));
+  if (repeated.outcome !== "already_absent") throw new Error(`release was not idempotent: ${JSON.stringify(repeated)}`);
+
+  const replacementResult = JSON.parse(await runSurf("session.ensure", "real-chrome-release", "about:blank", "--tab", "--json"));
+  const replacement = replacementResult.session;
+  const oldAgainstReplacement = JSON.parse(await runSurf("session.release", "real-chrome-release", ...releaseArgs(original)));
+  if (oldAgainstReplacement.outcome !== "retained") {
+    throw new Error(`replacement accepted stale receipt: ${JSON.stringify(oldAgainstReplacement)}`);
+  }
+  const replacementReleased = JSON.parse(await runSurf("session.release", "real-chrome-release", ...releaseArgs(replacement)));
+  if (replacementReleased.outcome !== "released") throw new Error(`replacement release failed: ${JSON.stringify(replacementReleased)}`);
+
+  const adoptSeedResult = JSON.parse(await runSurf("session.ensure", "real-chrome-adopted", "about:blank", "--tab", "--json"));
+  const adoptSeedPage = (await browser.pages()).find((page) => page.url() === "about:blank");
+  if (!adoptSeedPage) throw new Error("adopted-session seed page was absent");
+  await adoptSeedPage.close();
+  const adoptedResult = JSON.parse(await runSurf(
+    "session.rebind", "real-chrome-adopted", "--tab-id", String(fixtureTab.id), "--replace", "--json",
+  ));
+  const adopted = adoptedResult.session;
+  if (adopted.ownership !== "adopted") throw new Error(`rebind did not adopt: ${JSON.stringify(adoptedResult)}`);
+  const adoptedReleased = JSON.parse(await runSurf("session.release", "real-chrome-adopted", ...releaseArgs(adopted)));
+  if (adoptedReleased.outcome !== "released" || adoptedReleased.targetClosed || !adoptedReleased.adoptedTargetKept) {
+    throw new Error(`adopted release was unsafe: ${JSON.stringify(adoptedReleased)}`);
+  }
+  if (fixturePage.isClosed()) throw new Error("adopted release closed the fixture target");
+
   console.log(
     JSON.stringify(
       {
@@ -430,6 +485,7 @@ try {
 }
 
 if (failure) {
+  console.error("Earliest-landmark receipt:", JSON.stringify(landmarks));
   for (const cleanupError of cleanupErrors) console.error("Cleanup error:", cleanupError);
   throw failure;
 }

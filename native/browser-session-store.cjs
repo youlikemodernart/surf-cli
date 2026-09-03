@@ -178,6 +178,22 @@ class BrowserSessionStore {
     });
   }
 
+  compareAndRemove(identity, name, expected) {
+    validateSessionName(name);
+    const key = normalizeName(name);
+    const state = this.load();
+    const bucket = this.bucket(state, identity.browserInstanceId, false);
+    const existing = bucket.sessions?.[key];
+    if (!existing) return { outcome: "absent", record: null };
+    const fields = ["bindingId", "browserInstanceId", "browserEpoch", "tabId", "ownership"];
+    if (!expected || fields.some((field) => existing[field] !== expected[field])) {
+      return { outcome: "mismatch", record: { ...existing } };
+    }
+    delete bucket.sessions[key];
+    this.save(state);
+    return { outcome: "removed", record: { ...existing } };
+  }
+
   remove(identity, name) {
     validateSessionName(name);
     const key = normalizeName(name);

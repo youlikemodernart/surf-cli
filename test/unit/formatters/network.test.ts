@@ -99,6 +99,106 @@ describe("network formatters", () => {
       expect(output).toContain("https://example.com/api/test");
       expect(output).toContain("Total: 1 requests");
     });
+
+    it("uses summary mimeType and responseBodySize fallbacks", () => {
+      const output = network.formatCompact([
+        {
+          id: "r_summary",
+          method: "GET",
+          status: 200,
+          url: "https://example.test/api",
+          mimeType: "application/json",
+          responseBodySize: 1536,
+        },
+      ]);
+
+      expect(output).toContain("json");
+      expect(output).toContain("1.5K");
+    });
+
+    it("does not throw for fail-closed invalid URL placeholders", () => {
+      expect(() =>
+        network.formatCompact([
+          {
+            id: "r_invalid",
+            method: "GET",
+            status: 0,
+            url: "<redacted-invalid-url>",
+            origin: "",
+            flags: ["failed"],
+            failureReason: "net::ERR_INVALID_URL",
+          },
+        ]),
+      ).not.toThrow();
+      expect(
+        network.formatCompact([
+          {
+            id: "r_invalid",
+            method: "GET",
+            status: 0,
+            url: "<redacted-invalid-url>",
+            origin: "",
+            flags: ["failed"],
+            failureReason: "net::ERR_INVALID_URL",
+          },
+        ]),
+      ).toContain("<redacted-invalid-url>");
+    });
+
+    it("shows failure reasons and honest truncated counts", () => {
+      const output = network.formatCompact(
+        [
+          {
+            id: "r_failed",
+            method: "GET",
+            status: 0,
+            type: "XHR",
+            url: "https://example.test/api",
+            failureReason: "net::ERR_CONNECTION_RESET",
+          },
+        ],
+        { totalEntries: 12, truncated: true },
+      );
+
+      expect(output).toContain("FAIL");
+      expect(output).toContain("net::ERR_CONNECTION_RESET");
+      expect(output).toContain("Showing: 1 of 12 requests");
+    });
+  });
+
+  describe("formatVerbose", () => {
+    it("renders status zero as FAILED with a bounded reason", () => {
+      const reason = `net::ERR_FAILED ${"x".repeat(500)}`;
+      const output = network.formatVerbose(
+        [
+          {
+            id: "r_failed",
+            method: "GET",
+            status: 0,
+            url: "https://example.test",
+            failureReason: reason,
+          },
+        ],
+        1,
+      );
+
+      expect(output).toContain("Status: FAILED");
+      expect(output).toContain("Failure: net::ERR_FAILED");
+      expect(output).not.toContain("Status: pending");
+      expect(output).not.toContain(reason);
+    });
+  });
+
+  describe("formatResultCount", () => {
+    it("preserves total, returned, and truncation metadata", () => {
+      expect(
+        network.formatResultCount([{}], {
+          totalEntries: 4,
+          returnedEntries: 1,
+          truncated: true,
+        }),
+      ).toBe("Count: total=4, returned=1, truncated=true");
+    });
   });
 
   describe("formatCurl", () => {

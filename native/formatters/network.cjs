@@ -56,6 +56,7 @@ function getContentTypeShort(contentType) {
  * Get status code style indicator
  */
 function getStatusIndicator(status) {
+  if (status === 0) return 'FAIL';
   if (!status) return '...';
   if (status >= 200 && status < 300) return String(status);
   if (status >= 300 && status < 400) return `${status}→`;
@@ -86,7 +87,14 @@ function formatCompact(entries, options = {}) {
   let lastTime = null;
   
   for (const e of entries) {
-    const origin = e.origin || new URL(e.url).origin;
+    let origin = e.origin || "";
+    if (!origin) {
+      try {
+        origin = new URL(e.url).origin;
+      } catch {
+        origin = "<invalid-url>";
+      }
+    }
     const timestamp = e.timestamp || e.startTime;
     
     // Add origin separator if changed
@@ -103,12 +111,13 @@ function formatCompact(entries, options = {}) {
     const id = (e.requestId || e.id || '-').slice(0, 8).padEnd(8);
     const method = (e.method || 'GET').padEnd(6);
     const status = getStatusIndicator(e.status).padEnd(6);
-    const type = getContentTypeShort(e.contentType || e.responseHeaders?.['content-type']).padEnd(5);
-    const size = formatSize(e.responseSize || e.encodedDataLength).padEnd(6);
+    const type = getContentTypeShort(e.contentType || e.mimeType || e.responseHeaders?.['content-type']).padEnd(5);
+    const size = formatSize(e.responseSize ?? e.responseBodySize ?? e.encodedDataLength).padEnd(6);
     const time = formatDuration(e.duration || e.time).padEnd(6);
-    const url = truncateUrl(e.url, 60);
+    const failure = e.failureReason ? ` (${truncateValue(e.failureReason, 80)})` : '';
+    const url = truncateUrl(e.url, Math.max(20, 60 - failure.length));
     
-    lines.push(`${id} │ ${method} │ ${status} │ ${type} │ ${size} │ ${time} │ ${url}`);
+    lines.push(`${id} │ ${method} │ ${status} │ ${type} │ ${size} │ ${time} │ ${url}${failure}`);
     
     lastOrigin = origin;
     lastTime = timestamp;
@@ -116,8 +125,13 @@ function formatCompact(entries, options = {}) {
   
   // Summary
   lines.push('');
-  const totalSize = entries.reduce((acc, e) => acc + (e.responseSize || e.encodedDataLength || 0), 0);
-  lines.push(`Total: ${entries.length} requests, ${formatSize(totalSize)}`);
+  const totalSize = entries.reduce((acc, e) => acc + (e.responseSize || e.responseBodySize || e.encodedDataLength || 0), 0);
+  const totalEntries = Number.isInteger(options.totalEntries) ? options.totalEntries : entries.length;
+  if (options.truncated || totalEntries !== entries.length) {
+    lines.push(`Showing: ${entries.length} of ${totalEntries} requests, ${formatSize(totalSize)} shown`);
+  } else {
+    lines.push(`Total: ${entries.length} requests, ${formatSize(totalSize)}`);
+  }
   
   return lines.join('\n');
 }
@@ -190,7 +204,9 @@ function formatVerbose(entries, level = 1) {
   for (const e of entries) {
     lines.push('═'.repeat(80));
     lines.push(`${e.method || 'GET'} ${e.url}`);
-    lines.push(`ID: ${e.requestId || e.id || '-'}  Status: ${e.status || 'pending'}  Time: ${formatDuration(e.duration || e.time)}`);
+    const status = e.status === 0 ? 'FAILED' : (e.status ?? 'pending');
+    lines.push(`ID: ${e.requestId || e.id || '-'}  Status: ${status}  Time: ${formatDuration(e.duration || e.time)}`);
+    if (e.failureReason) lines.push(`Failure: ${truncateValue(e.failureReason, 200)}`);
     lines.push('');
     
     // Request headers
@@ -241,6 +257,17 @@ function formatVerbose(entries, level = 1) {
 function formatEntry(entry) {
   if (!entry) return 'Request not found';
   return formatVerbose([entry], 2);
+}
+
+function formatResultCount(entries, options = {}) {
+  const returnedEntries = Number.isInteger(options.returnedEntries)
+    ? options.returnedEntries
+    : (entries?.length || 0);
+  const totalEntries = Number.isInteger(options.totalEntries)
+    ? options.totalEntries
+    : returnedEntries;
+  const truncated = options.truncated === true || returnedEntries < totalEntries;
+  return `Count: total=${totalEntries}, returned=${returnedEntries}, truncated=${truncated}`;
 }
 
 /**
@@ -393,6 +420,7 @@ module.exports = {
   formatRaw, 
   formatVerbose,
   formatEntry,
+  formatResultCount,
   formatOrigins,
   formatStats,
   formatSize,

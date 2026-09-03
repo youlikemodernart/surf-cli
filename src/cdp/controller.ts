@@ -67,6 +67,10 @@ export interface NetworkEntry {
   
   // Flags
   flags: string[];               // ["binary", "truncated", "protobuf", "failed"]
+  failureReason?: string;
+  canceled?: boolean;
+  blockedReason?: string;
+  corsErrorStatus?: unknown;
   
   // Internal tracking
   _requestId: string;            // CDP requestId for lazy loading
@@ -450,7 +454,7 @@ export class CDPController {
     };
 
     // Limit entries per tab
-    if (entriesMap.size > 500) {
+    if (entriesMap.size >= 500) {
       const oldestKey = entriesMap.keys().next().value;
       if (oldestKey) entriesMap.delete(oldestKey);
     }
@@ -574,6 +578,11 @@ export class CDPController {
       
       entry.status = 0;
       entry.flags.push('failed');
+      entry.failureReason = params.errorText;
+      entry.canceled = params.canceled === true;
+      entry.blockedReason = params.blockedReason;
+      entry.corsErrorStatus = params.corsErrorStatus;
+      entry.bodyCapture = { mode: entry.bodyCapture.mode, complete: false, reason: "request-failed" };
       entry._loadingFinished = true;
     }
   }

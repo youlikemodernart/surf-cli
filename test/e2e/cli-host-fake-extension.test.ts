@@ -59,6 +59,9 @@ type NativeMessage = Record<string, unknown> & {
 
 type FakeHostOptions = {
   targetActive?: boolean;
+  targetInspectionFailures?: number[];
+  targetInspectionError?: NativeMessage;
+  targetInspectionResponse?: NativeMessage;
 };
 
 type CliResult = {
@@ -118,10 +121,23 @@ function writeNativeMessage(stdin: WritableLike, message: NativeMessage) {
   stdin.write(BufferCtor.concat([header, BufferCtor.from(json, "utf8")]));
 }
 
-function buildExtensionResponse(message: NativeMessage, currentUrl: string, targetActive: boolean) {
+function buildExtensionResponse(
+  message: NativeMessage,
+  currentUrl: string,
+  targetActive: boolean,
+  targetExists = true,
+) {
   switch (message.type) {
     case "TARGET_RESOLVE":
     case "TARGET_INSPECT":
+      if (!targetExists) {
+        return {
+          id: message.id,
+          error: "No tab with id: 42",
+          errorCode: "tab_gone",
+          errorDetails: { tabId: 42 },
+        };
+      }
       return {
         id: message.id,
         tabId: message.tabId || 42,
@@ -166,6 +182,40 @@ function buildExtensionResponse(message: NativeMessage, currentUrl: string, targ
         width: 1,
         height: 1,
       };
+    case "READ_NETWORK_REQUESTS":
+      if (message.origin === "empty.fixture.test") {
+        return {
+          id: message.id,
+          entries: [],
+          totalEntries: 3,
+          returnedEntries: 0,
+          truncated: true,
+          maxBytes: 30 * 1024,
+          format: message.format,
+        };
+      }
+      return {
+        id: message.id,
+        entries: [
+          {
+            id: "r_failed",
+            ts: 1,
+            method: "GET",
+            url: "https://fixture.test/api?token=%3Credacted%3E",
+            origin: "https://fixture.test",
+            status: 0,
+            type: "XHR",
+            flags: ["failed"],
+            failureReason: "net::ERR_CONNECTION_RESET",
+            bodyCapture: { mode: "none", complete: false, reason: "request-failed" },
+          },
+        ],
+        totalEntries: 4,
+        returnedEntries: 1,
+        truncated: true,
+        maxBytes: 30 * 1024,
+        format: message.format,
+      };
     case "EXECUTE_JAVASCRIPT":
       return {
         id: message.id,
@@ -195,7 +245,10 @@ function startHost(socketPath: string, options: FakeHostOptions = {}) {
   const waiters: MessageWaiter[] = [];
   let stdoutBuffer = BufferCtor.alloc(0);
   let currentUrl = "about:blank";
+  let targetExists = true;
+  let targetInspectionCount = 0;
   const targetActive = options.targetActive !== false;
+  const targetInspectionFailures = new Set(options.targetInspectionFailures ?? []);
   let stderr = "";
   let closed = false;
 
@@ -251,7 +304,32 @@ function startHost(socketPath: string, options: FakeHostOptions = {}) {
       if (message.type === "EXECUTE_NAVIGATE" && message.url) {
         currentUrl = message.url;
       }
-      writeNativeMessage(child.stdin, buildExtensionResponse(message, currentUrl, targetActive));
+      if (message.type === "TARGET_INSPECT") {
+        targetInspectionCount += 1;
+        if (targetInspectionFailures.has(targetInspectionCount)) {
+          writeNativeMessage(child.stdin, {
+            id: message.id,
+            error: "Tabs permission temporarily unavailable",
+            errorCode: "target_inspection_failed",
+          });
+          continue;
+        }
+        if (options.targetInspectionError) {
+          writeNativeMessage(child.stdin, { ...options.targetInspectionError, id: message.id });
+          continue;
+        }
+        if (options.targetInspectionResponse) {
+          writeNativeMessage(child.stdin, { ...options.targetInspectionResponse, id: message.id });
+          continue;
+        }
+      }
+      writeNativeMessage(
+        child.stdin,
+        buildExtensionResponse(message, currentUrl, targetActive, targetExists),
+      );
+      if (message.type === "SESSION_CLOSE_TARGET") {
+        targetExists = false;
+      }
     }
   });
 
@@ -360,7 +438,12 @@ afterEach(() => {
   }
 });
 
-function seedOldSession(stateDir: string, ownership = "surf-created") {
+function seedOldSession(
+  stateDir: string,
+  ownership = "surf-created",
+  mode = "window",
+  taskOwnedBackground = false,
+) {
   const browserEpoch = `contract-epoch-${process.pid}`;
   fs.writeFileSync(
     path.join(stateDir, "browser-sessions.json"),
@@ -376,8 +459,9 @@ function seedOldSession(stateDir: string, ownership = "surf-created") {
               browserEpoch,
               tabId: 42,
               windowId: 7,
-              mode: "window",
+              mode,
               ownership,
+              taskOwnedBackground,
               lastUrl: "https://fixture.test/old",
               createdAt: "2000-01-01T00:00:00.000Z",
               updatedAt: "2000-01-01T00:00:00.000Z",
@@ -393,6 +477,13 @@ function seedOldSession(stateDir: string, ownership = "surf-created") {
   );
 }
 
+function hasOldSession(stateDir: string) {
+  const state = JSON.parse(
+    fs.readFileSync(path.join(stateDir, "browser-sessions.json"), "utf8"),
+  ) as { browsers: { "contract-browser": { sessions: Record<string, unknown> } } };
+  return Boolean(state.browsers["contract-browser"].sessions.old);
+}
+
 function sessionAccessTime(stateDir: string) {
   const state = JSON.parse(
     fs.readFileSync(path.join(stateDir, "browser-sessions.json"), "utf8"),
@@ -403,6 +494,77 @@ function sessionAccessTime(stateDir: string) {
 }
 
 describe("CLI/native-host/fake-extension E2E contract", () => {
+  it("renders bounded failed network summaries through extension, host, and CLI", async () => {
+    const socketPath = createSocketPath();
+    const host = startHost(socketPath);
+
+    try {
+      await host.waitForMessage((message) => message.type === "HOST_READY");
+      const result = await runCli(socketPath, [
+        "network",
+        "--origin",
+        "fixture.test",
+        "--last",
+        "10",
+      ]);
+
+      expect(result.code).toBe(0);
+      expect(result.stdout).toContain("FAIL");
+      expect(result.stdout).toContain("net::ERR_CONNECTION_RESET");
+      expect(result.stdout).toContain("Showing: 1 of 4 requests");
+      expect(result.stdout).not.toContain("pending");
+      expect(result.stdout).not.toContain("Authorization");
+
+      const rawResult = await runCli(socketPath, ["network", "--format", "raw"]);
+      expect(rawResult.code).toBe(0);
+      expect(JSON.parse(rawResult.stdout)).toMatchObject({
+        totalEntries: 4,
+        returnedEntries: 1,
+        truncated: true,
+        maxBytes: 30 * 1024,
+        entries: [{ status: 0, failureReason: "net::ERR_CONNECTION_RESET" }],
+      });
+
+      for (const format of ["urls", "curl", "verbose"]) {
+        const formattedResult = await runCli(socketPath, ["network", "--format", format]);
+        expect(formattedResult.code).toBe(0);
+        expect(formattedResult.stdout).toContain("Count: total=4, returned=1, truncated=true");
+        if (format === "verbose") {
+          expect(formattedResult.stdout).toContain("Status: FAILED");
+          expect(formattedResult.stdout).toContain("Failure: net::ERR_CONNECTION_RESET");
+          expect(formattedResult.stdout).not.toContain("Status: pending");
+        }
+      }
+
+      const emptyRawResult = await runCli(socketPath, [
+        "network",
+        "--origin",
+        "empty.fixture.test",
+        "--format",
+        "raw",
+      ]);
+      expect(emptyRawResult.code).toBe(0);
+      expect(JSON.parse(emptyRawResult.stdout)).toMatchObject({
+        entries: [],
+        totalEntries: 3,
+        returnedEntries: 0,
+        truncated: true,
+        maxBytes: 30 * 1024,
+      });
+
+      expect(host.messages).toContainEqual(
+        expect.objectContaining({
+          type: "READ_NETWORK_REQUESTS",
+          origin: "fixture.test",
+          limit: 10,
+          full: true,
+        }),
+      );
+    } finally {
+      await host.dispose();
+    }
+  });
+
   it("runs browser-like navigation, page text, and screenshot flows without Chrome", async () => {
     const socketPath = createSocketPath();
     const host = startHost(socketPath);
@@ -522,6 +684,312 @@ describe("CLI/native-host/fake-extension E2E contract", () => {
       );
     } finally {
       await host.dispose();
+    }
+  });
+
+  it("CAS-releases exact Surf-created sessions and reconciles idempotently", async () => {
+    const socketPath = createSocketPath();
+    const host = startHost(socketPath, { targetActive: false });
+    const releaseArgs = [
+      "session.release",
+      "old",
+      "--binding-id",
+      "old-binding",
+      "--browser-instance-id",
+      "contract-browser",
+      "--browser-epoch",
+      `contract-epoch-${process.pid}`,
+      "--expected-tab-id",
+      "42",
+      "--ownership",
+      "surf-created",
+      "--json",
+    ];
+
+    try {
+      await host.waitForMessage((message) => message.type === "HOST_READY");
+      seedOldSession(host.stateDir);
+
+      const released = await runCli(socketPath, releaseArgs);
+      expect(released.code).toBe(0);
+      expect(JSON.parse(released.stdout)).toMatchObject({
+        outcome: "released",
+        name: "old",
+        tabId: 42,
+        ownership: "surf-created",
+        targetClosed: true,
+      });
+      expect(
+        host.messages.filter((message) => message.type === "SESSION_CLOSE_TARGET"),
+      ).toHaveLength(1);
+
+      const repeated = await runCli(socketPath, releaseArgs);
+      expect(repeated.code).toBe(0);
+      expect(JSON.parse(repeated.stdout)).toMatchObject({
+        outcome: "already_absent",
+        targetClosed: false,
+      });
+      expect(
+        host.messages.filter((message) => message.type === "SESSION_CLOSE_TARGET"),
+      ).toHaveLength(1);
+    } finally {
+      await host.dispose();
+    }
+  });
+
+  it("retains bindings when target inspection is uncertain before or after close", async () => {
+    const releaseArgs = [
+      "session.release",
+      "old",
+      "--binding-id",
+      "old-binding",
+      "--browser-instance-id",
+      "contract-browser",
+      "--browser-epoch",
+      `contract-epoch-${process.pid}`,
+      "--expected-tab-id",
+      "42",
+      "--ownership",
+      "surf-created",
+      "--json",
+    ];
+
+    for (const targetInspectionFailures of [[1], [2]]) {
+      const socketPath = createSocketPath();
+      const host = startHost(socketPath, { targetActive: false, targetInspectionFailures });
+      try {
+        await host.waitForMessage((message) => message.type === "HOST_READY");
+        seedOldSession(host.stateDir);
+
+        const result = await runCli(socketPath, releaseArgs);
+        expect(result.code).toBe(0);
+        expect(JSON.parse(result.stdout)).toMatchObject({
+          outcome: "retained",
+          targetClosed: false,
+          blocker: "target_state_unknown",
+        });
+        expect(hasOldSession(host.stateDir)).toBe(true);
+        expect(
+          host.messages.filter((message) => message.type === "SESSION_CLOSE_TARGET"),
+        ).toHaveLength(targetInspectionFailures[0] === 1 ? 0 : 1);
+      } finally {
+        await host.dispose();
+      }
+    }
+  });
+
+  it("does not let extension error details forge authoritative absence", async () => {
+    const socketPath = createSocketPath();
+    const host = startHost(socketPath, {
+      targetActive: false,
+      targetInspectionError: {
+        error: "Tabs permission temporarily unavailable",
+        errorCode: "target_inspection_failed",
+        errorDetails: { code: "tab_gone", tabId: 42 },
+      },
+    });
+    try {
+      await host.waitForMessage((message) => message.type === "HOST_READY");
+      seedOldSession(host.stateDir);
+
+      const result = await runCli(socketPath, [
+        "session.release",
+        "old",
+        "--binding-id",
+        "old-binding",
+        "--browser-instance-id",
+        "contract-browser",
+        "--browser-epoch",
+        `contract-epoch-${process.pid}`,
+        "--expected-tab-id",
+        "42",
+        "--ownership",
+        "surf-created",
+        "--json",
+      ]);
+      expect(result.code).toBe(0);
+      expect(JSON.parse(result.stdout)).toMatchObject({
+        outcome: "retained",
+        targetClosed: false,
+        blocker: "target_state_unknown",
+      });
+      expect(hasOldSession(host.stateDir)).toBe(true);
+      expect(host.messages.some((message) => message.type === "SESSION_CLOSE_TARGET")).toBe(false);
+    } finally {
+      await host.dispose();
+    }
+  });
+
+  it("retains a binding when structured absence identifies another tab", async () => {
+    const socketPath = createSocketPath();
+    const host = startHost(socketPath, {
+      targetActive: false,
+      targetInspectionError: {
+        error: "Tab 43 gone",
+        errorCode: "tab_gone",
+        errorDetails: { tabId: 43 },
+      },
+    });
+    try {
+      await host.waitForMessage((message) => message.type === "HOST_READY");
+      seedOldSession(host.stateDir);
+
+      const result = await runCli(socketPath, [
+        "session.release",
+        "old",
+        "--binding-id",
+        "old-binding",
+        "--browser-instance-id",
+        "contract-browser",
+        "--browser-epoch",
+        `contract-epoch-${process.pid}`,
+        "--expected-tab-id",
+        "42",
+        "--ownership",
+        "surf-created",
+        "--json",
+      ]);
+      expect(result.code).toBe(0);
+      expect(JSON.parse(result.stdout)).toMatchObject({
+        outcome: "retained",
+        targetClosed: false,
+        blocker: "target_state_unknown",
+      });
+      expect(hasOldSession(host.stateDir)).toBe(true);
+      expect(host.messages.some((message) => message.type === "SESSION_CLOSE_TARGET")).toBe(false);
+    } finally {
+      await host.dispose();
+    }
+  });
+
+  it("retains a binding when the extension reports mismatched target identity", async () => {
+    const socketPath = createSocketPath();
+    const host = startHost(socketPath, {
+      targetActive: false,
+      targetInspectionResponse: { tabId: 405, windowId: 7, active: false },
+    });
+    try {
+      await host.waitForMessage((message) => message.type === "HOST_READY");
+      seedOldSession(host.stateDir);
+
+      const result = await runCli(socketPath, [
+        "session.release",
+        "old",
+        "--binding-id",
+        "old-binding",
+        "--browser-instance-id",
+        "contract-browser",
+        "--browser-epoch",
+        `contract-epoch-${process.pid}`,
+        "--expected-tab-id",
+        "42",
+        "--ownership",
+        "surf-created",
+        "--json",
+      ]);
+      expect(result.code).toBe(0);
+      expect(JSON.parse(result.stdout)).toMatchObject({
+        outcome: "retained",
+        targetClosed: false,
+        blocker: "target_identity_changed",
+      });
+      expect(hasOldSession(host.stateDir)).toBe(true);
+      expect(host.messages.some((message) => message.type === "SESSION_CLOSE_TARGET")).toBe(false);
+    } finally {
+      await host.dispose();
+    }
+  });
+
+  it.each([
+    { mode: "tab", taskOwnedBackground: false },
+    { mode: "window", taskOwnedBackground: false },
+  ])(
+    "rejects a task-owned ensure collision with $mode provenance",
+    async ({ mode, taskOwnedBackground }) => {
+      const socketPath = createSocketPath();
+      const host = startHost(socketPath);
+      try {
+        await host.waitForMessage((message) => message.type === "HOST_READY");
+        seedOldSession(host.stateDir, "surf-created", mode, taskOwnedBackground);
+
+        const result = await runCli(socketPath, [
+          "session.ensure",
+          "old",
+          "--task-owned",
+          "--json",
+        ]);
+        expect(result.code).toBe(1);
+        expect(result.stderr).toContain("not a task-owned background window");
+        expect(hasOldSession(host.stateDir)).toBe(true);
+      } finally {
+        await host.dispose();
+      }
+    },
+  );
+
+  it("retains stale release identities and keeps adopted targets open", async () => {
+    const staleSocket = createSocketPath();
+    const staleHost = startHost(staleSocket, { targetActive: false });
+    try {
+      await staleHost.waitForMessage((message) => message.type === "HOST_READY");
+      seedOldSession(staleHost.stateDir);
+      const stale = await runCli(staleSocket, [
+        "session.release",
+        "old",
+        "--binding-id",
+        "replacement",
+        "--browser-instance-id",
+        "contract-browser",
+        "--browser-epoch",
+        `contract-epoch-${process.pid}`,
+        "--expected-tab-id",
+        "42",
+        "--ownership",
+        "surf-created",
+        "--json",
+      ]);
+      expect(JSON.parse(stale.stdout)).toMatchObject({
+        outcome: "retained",
+        blocker: "binding_changed",
+      });
+      expect(staleHost.messages.some((message) => message.type === "SESSION_CLOSE_TARGET")).toBe(
+        false,
+      );
+    } finally {
+      await staleHost.dispose();
+    }
+
+    const adoptedSocket = createSocketPath();
+    const adoptedHost = startHost(adoptedSocket, { targetActive: false });
+    try {
+      await adoptedHost.waitForMessage((message) => message.type === "HOST_READY");
+      seedOldSession(adoptedHost.stateDir, "adopted");
+      const adopted = await runCli(adoptedSocket, [
+        "session.release",
+        "old",
+        "--binding-id",
+        "old-binding",
+        "--browser-instance-id",
+        "contract-browser",
+        "--browser-epoch",
+        `contract-epoch-${process.pid}`,
+        "--expected-tab-id",
+        "42",
+        "--ownership",
+        "adopted",
+        "--json",
+      ]);
+      expect(JSON.parse(adopted.stdout)).toMatchObject({
+        outcome: "released",
+        ownership: "adopted",
+        targetClosed: false,
+        adoptedTargetKept: true,
+      });
+      expect(adoptedHost.messages.some((message) => message.type === "SESSION_CLOSE_TARGET")).toBe(
+        false,
+      );
+    } finally {
+      await adoptedHost.dispose();
     }
   });
 

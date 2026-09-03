@@ -19,10 +19,19 @@ describe("tool scope classification", () => {
       scope: "browser-read",
       targetUse: "host",
     });
+    expect(classifyTool("session.release")).toMatchObject({ scope: "host", targetUse: "host" });
   });
 
   it("keeps tab operations independent and provider browser flows exclusive", () => {
     expect(classifyTool("page.read")).toMatchObject({ scope: "tab", targetUse: "default-tab" });
+    expect(classifyTool("get_network_entries")).toMatchObject({
+      scope: "tab",
+      targetUse: "default-tab",
+    });
+    expect(classifyTool("read_network_requests")).toMatchObject({
+      scope: "tab",
+      targetUse: "default-tab",
+    });
     expect(classifyTool("chatgpt")).toMatchObject({ scope: "provider", targetUse: "default-tab" });
     expect(classifyTool("oracle.result")).toMatchObject({ scope: "host", targetUse: "host" });
   });

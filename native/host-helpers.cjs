@@ -168,28 +168,35 @@ function formatToolContent(result, log = () => {}, options = {}) {
   // Handle both requests (basic) and entries (full) formats
   const items = result.requests || result.entries;
   if (items && Array.isArray(items)) {
-    if (items.length === 0) {
-      return text("No network requests captured");
-    }
     let formatted;
-    if (result.format === 'curl') {
+    if (result.format === 'raw') {
+      formatted = JSON.stringify({
+        entries: items,
+        totalEntries: result.totalEntries ?? items.length,
+        returnedEntries: result.returnedEntries ?? items.length,
+        truncated: result.truncated === true,
+        maxBytes: result.maxBytes,
+        _format: 'raw',
+      }, null, 2);
+    } else if (items.length === 0) {
+      const total = result.totalEntries ?? 0;
+      formatted = total > 0 ? `Showing: 0 of ${total} requests` : "No network requests captured";
+    } else if (result.format === 'curl') {
       formatted = networkFormatters.formatCurlBatch(items);
     } else if (result.format === 'urls') {
       formatted = networkFormatters.formatUrls(items);
-    } else if (result.format === 'raw') {
-      formatted = networkFormatters.formatRaw(items);
-    } else if (result.verbose > 0) {
-      formatted = networkFormatters.formatVerbose(items, result.verbose);
-    } else if (result.entries) {
-      // entries format means full data was requested - use verbose level 1
-      formatted = networkFormatters.formatVerbose(items, 1);
+    } else if (result.format === 'verbose' || result.verbose > 0) {
+      formatted = networkFormatters.formatVerbose(items, result.verbose || 1);
     } else {
-      formatted = items.map(r => {
-        const status = String(r.status || '-').padStart(3);
-        const method = (r.method || 'GET').padEnd(7);
-        const type = (r.type || '').padEnd(10);
-        return `${status} ${method} ${type} ${r.url}`;
-      }).join("\n");
+      formatted = networkFormatters.formatCompact(items, {
+        totalEntries: result.totalEntries,
+        truncated: result.truncated,
+      });
+    }
+    if (items.length > 0 && ['urls', 'curl', 'verbose'].includes(result.format)) {
+      formatted += `\n\n${networkFormatters.formatResultCount(items, result)}`;
+    } else if (items.length > 0 && result.verbose > 0) {
+      formatted += `\n\n${networkFormatters.formatResultCount(items, result)}`;
     }
     return text(formatted);
   }
@@ -701,21 +708,33 @@ function mapToolToMessage(tool, args, tabId) {
       };
     case "network":
     case "get_network_entries":
+    case "read_network_requests": {
+      const rawLimit = a.limit ?? a.last;
+      const limit = rawLimit === undefined ? undefined : Number(rawLimit);
+      if (limit !== undefined && (!Number.isInteger(limit) || limit < 0 || limit > 500)) {
+        throw new Error("network limit must be an integer between 0 and 500");
+      }
+      const format = a.format;
+      if (format !== undefined && !["compact", "urls", "curl", "raw", "verbose"].includes(format)) {
+        throw new Error("network format must be compact, urls, curl, raw, or verbose");
+      }
       return { 
         type: "READ_NETWORK_REQUESTS",
-        full: a.v || a.vv || a.format === 'curl' || a.format === 'verbose' || a.format === 'raw',
-        urlPattern: a.filter || a.url_pattern || a.origin,
+        full: true,
+        urlPattern: a.filter || a.url_pattern,
+        origin: a.origin,
         method: a.method,
         status: a.status,
         contentType: a.type,
-        limit: a.limit || a.last,
-        format: a.format,
+        limit,
+        format,
         verbose: a.v ? 1 : (a.vv ? 2 : 0),
         bodyMode: a["body-mode"] || a.bodyMode,
         perBodyBytes: a["per-body-bytes"] || a.perBodyBytes,
         totalBodyBytes: a["total-body-bytes"] || a.totalBodyBytes,
         ...baseMsg 
       };
+    }
 
     case "network.get":
     case "get_network_entry":
@@ -780,14 +799,6 @@ function mapToolToMessage(tool, args, tabId) {
         ...baseMsg 
       };
 
-    case "read_network_requests":
-      return { 
-        type: "READ_NETWORK_REQUESTS", 
-        urlPattern: a.url_pattern,
-        limit: a.limit,
-        clear: a.clear,
-        ...baseMsg 
-      };
     case "upload_image":
       return { 
         type: "UPLOAD_IMAGE", 

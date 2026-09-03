@@ -558,7 +558,50 @@ export function emitOracleFinished(pi: Pi, job: unknown): boolean {
   return true;
 }
 
-function registerTool(pi: Pi, name: string, description: string, parameters: unknown, map: (args: Record<string, unknown>) => [string, Record<string, unknown>, number | undefined]) {
+export function mapSessionEnsureArgs(args: Record<string, unknown>): [string, Record<string, unknown>, undefined] {
+  return ["session.ensure", { name: args.name, url: args.url, window: true, focused: false, "task-owned": true }, undefined];
+}
+
+export function projectSessionEnsureResult(result: ToolResult): ToolResult {
+  if (result.isError) return result;
+  const details = result.details as { session?: Record<string, unknown>; created?: unknown; reopened?: unknown } | undefined;
+  const session = details?.session;
+  const receipt = session && {
+    name: session.name,
+    bindingId: session.bindingId,
+    browserInstanceId: session.browserInstanceId,
+    browserEpoch: session.browserEpoch,
+    tabId: session.tabId,
+    ownership: session.ownership,
+    created: details?.created === true,
+    reopened: details?.reopened === true,
+  };
+  if (
+    !receipt ||
+    typeof receipt.name !== "string" ||
+    typeof receipt.bindingId !== "string" ||
+    typeof receipt.browserInstanceId !== "string" ||
+    typeof receipt.browserEpoch !== "string" ||
+    typeof receipt.tabId !== "number" ||
+    receipt.ownership !== "surf-created"
+  ) {
+    return textResult("Surf session ensure did not return an exact task-owned identity receipt", true);
+  }
+  return { ...textResult(receipt), details: receipt };
+}
+
+export function mapSessionReleaseArgs(args: Record<string, unknown>): [string, Record<string, unknown>, undefined] {
+  return ["session.release", { name: args.name, "binding-id": args.bindingId, "browser-instance-id": args.browserInstanceId, "browser-epoch": args.browserEpoch, "expected-tab-id": args.tabId, ownership: args.ownership, "no-wait": args.noWait }, undefined];
+}
+
+function registerTool(
+  pi: Pi,
+  name: string,
+  description: string,
+  parameters: unknown,
+  map: (args: Record<string, unknown>) => [string, Record<string, unknown>, number | undefined],
+  project: (result: ToolResult) => ToolResult = (result) => result,
+) {
   pi.registerTool({
     name,
     label: name,
@@ -567,7 +610,7 @@ function registerTool(pi: Pi, name: string, description: string, parameters: unk
     async execute(_id: string, args: Record<string, unknown>) {
       try {
         const [tool, toolArgs, tabId] = map(args);
-        return await requestSurf(tool, toolArgs, tabId);
+        return project(await requestSurf(tool, toolArgs, tabId));
       } catch (error) {
         return textResult(error instanceof Error ? error.message : String(error), true);
       }
@@ -576,6 +619,12 @@ function registerTool(pi: Pi, name: string, description: string, parameters: unk
 }
 
 export default function surfExtension(pi: Pi) {
+  registerTool(pi, "surf_session_ensure", "Create or reuse one task-owned background Surf window and return only its exact identity receipt.", Type.Object({
+    name: Type.String(), url: Type.Optional(Type.String()),
+  }), mapSessionEnsureArgs, projectSessionEnsureResult);
+  registerTool(pi, "surf_session_release", "Release one Surf session using only the exact identity returned by surf_session_ensure.", Type.Object({
+    name: Type.String(), bindingId: Type.String(), browserInstanceId: Type.String(), browserEpoch: Type.String(), tabId: Type.Number(), ownership: Type.String(), noWait: Type.Optional(Type.Boolean()),
+  }), mapSessionReleaseArgs);
   registerTool(pi, "surf_read", "Read the current Surf browser page. Read tools are safer for parallel scouts than browser actions.", Type.Object({
     tabId: Type.Optional(Type.Number()), filter: Type.Optional(Type.String()), depth: Type.Optional(Type.Number()), ref: Type.Optional(Type.String()), compact: Type.Optional(Type.Boolean()), maxBytes: Type.Optional(Type.Number()),
   }), (args) => ["page.read", { filter: args.filter, depth: args.depth, ref: args.ref, compact: args.compact, "max-bytes": args.maxBytes }, args.tabId as number | undefined]);

@@ -894,6 +894,34 @@ describe("CLI argument parsing", () => {
     });
   });
 
+  it("parses exact session.release identity without refreshing it", async () => {
+    const { request } = await runCli([
+      "session.release",
+      "task",
+      "--binding-id",
+      "binding",
+      "--browser-instance-id",
+      "browser",
+      "--browser-epoch",
+      "epoch",
+      "--expected-tab-id",
+      "42",
+      "--ownership",
+      "surf-created",
+    ]);
+    expect(request.params).toEqual({
+      tool: "session.release",
+      args: {
+        name: "task",
+        "binding-id": "binding",
+        "browser-instance-id": "browser",
+        "browser-epoch": "epoch",
+        "expected-tab-id": 42,
+        ownership: "surf-created",
+      },
+    });
+  });
+
   it("parses opt-in session.cleanup durations in dotted and spaced forms", async () => {
     const dotted = await runCli(["session.cleanup", "--idle-after", "5m", "--dry-run"]);
     expect(dotted.request.params).toEqual({

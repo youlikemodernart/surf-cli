@@ -9,6 +9,9 @@ const HOST_TOOLS = new Set([
   "wait",
   "session.list",
   "session.info",
+  // session.release performs its own identity-bound browser-write admission
+  // after validating the original receipt.
+  "session.release",
   "tab.unname", "tabs_unregister", "tab.named", "tabs_list_named",
 ]);
 
@@ -48,7 +51,7 @@ const TAB_TOOLS = new Set([
   "wait.element", "wait.url", "wait.network", "wait.dom", "wait.load", "health",
   "frame.list", "frame.switch", "frame.main", "frame.js",
   "dialog.accept", "dialog.dismiss", "dialog.info",
-  "console", "network", "network.get", "network.body", "network.curl", "network.path",
+  "console", "network", "get_network_entries", "read_network_requests", "network.get", "network.body", "network.curl", "network.path",
   "network.origins", "network.clear", "network.stats", "network.export",
   "emulate.network", "emulate.cpu", "emulate.geo", "emulate.device", "emulate.viewport", "emulate.touch",
   "perf.start", "perf.stop", "perf.metrics",

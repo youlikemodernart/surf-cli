@@ -151,15 +151,116 @@ describe("browser session handlers", () => {
     );
   });
 
-  it("treats closing an already-gone target as successful cleanup", async () => {
+  it("classifies only an explicit missing-tab error as authoritative absence", async () => {
     const handleMessage = await loadHandleMessage();
     const chrome = (globalThis as any).chrome;
-    chrome.tabs.remove.mockRejectedValue(new Error("No tab"));
+    chrome.tabs.get.mockRejectedValue(new Error("No tab with id: 404."));
+
+    await expect(handleMessage({ type: "TARGET_INSPECT", tabId: 404 }, {})).rejects.toMatchObject({
+      code: "tab_gone",
+      details: { tabId: 404 },
+    });
+  });
+
+  it("fails target inspection closed when browser state is uncertain", async () => {
+    const handleMessage = await loadHandleMessage();
+    const chrome = (globalThis as any).chrome;
+    chrome.tabs.get.mockRejectedValue(new Error("Tabs permission temporarily unavailable"));
+
+    await expect(handleMessage({ type: "TARGET_INSPECT", tabId: 404 }, {})).rejects.toMatchObject({
+      code: "target_inspection_failed",
+      details: { tabId: 404, cause: "Tabs permission temporarily unavailable" },
+    });
+  });
+
+  it("does not trust typed missing-tab errors even when they copy the browser message", async () => {
+    const handleMessage = await loadHandleMessage();
+    const chrome = (globalThis as any).chrome;
+    chrome.tabs.get.mockRejectedValue(
+      Object.assign(new Error("No tab with id: 404."), {
+        name: "BrowserCommandError",
+        code: "tab_gone",
+        details: { tabId: 405 },
+      }),
+    );
+
+    await expect(handleMessage({ type: "TARGET_INSPECT", tabId: 404 }, {})).rejects.toMatchObject({
+      code: "target_inspection_failed",
+      details: { tabId: 404 },
+    });
+  });
+
+  it("does not trust a typed missing-tab error bound to another tab", async () => {
+    const handleMessage = await loadHandleMessage();
+    const chrome = (globalThis as any).chrome;
+    chrome.tabs.get.mockRejectedValue(
+      Object.assign(new Error("Tab 405 gone"), {
+        name: "BrowserCommandError",
+        code: "tab_gone",
+        details: { tabId: 405 },
+      }),
+    );
+
+    await expect(handleMessage({ type: "TARGET_INSPECT", tabId: 404 }, {})).rejects.toMatchObject({
+      code: "target_inspection_failed",
+      details: { tabId: 404 },
+    });
+  });
+
+  it.each([
+    [{ id: 405, windowId: 9 }, "mismatched tab id"],
+    [{ id: "404", windowId: 9 }, "nonnumeric tab id"],
+    [{ id: 404, windowId: "9" }, "nonnumeric window id"],
+    [{ id: 404, windowId: 0 }, "invalid window id"],
+  ])("rejects %s returned by target inspection (%s)", async (tab, _description) => {
+    const handleMessage = await loadHandleMessage();
+    const chrome = (globalThis as any).chrome;
+    chrome.tabs.get.mockResolvedValue(tab);
+
+    await expect(handleMessage({ type: "TARGET_INSPECT", tabId: 404 }, {})).rejects.toMatchObject({
+      code: "target_inspection_failed",
+      details: { tabId: 404 },
+    });
+  });
+
+  it("treats closing a confirmed already-gone target as successful cleanup", async () => {
+    const handleMessage = await loadHandleMessage();
+    const chrome = (globalThis as any).chrome;
+    chrome.tabs.remove.mockRejectedValue(new Error("No tab with id: 404."));
 
     await expect(handleMessage({ type: "SESSION_CLOSE_TARGET", tabId: 404 }, {})).resolves.toEqual({
       success: true,
       tabId: 404,
       alreadyGone: true,
+    });
+  });
+
+  it("does not trust a typed close error bound to another tab", async () => {
+    const handleMessage = await loadHandleMessage();
+    const chrome = (globalThis as any).chrome;
+    chrome.tabs.remove.mockRejectedValue(
+      Object.assign(new Error("Tab 405 gone"), {
+        name: "BrowserCommandError",
+        code: "tab_gone",
+        details: { tabId: 405 },
+      }),
+    );
+
+    await expect(
+      handleMessage({ type: "SESSION_CLOSE_TARGET", tabId: 404 }, {}),
+    ).rejects.toMatchObject({ code: "target_close_failed", details: { tabId: 404 } });
+  });
+
+  it("does not convert an uncertain close failure into absence", async () => {
+    const handleMessage = await loadHandleMessage();
+    const chrome = (globalThis as any).chrome;
+    chrome.tabs.remove.mockRejectedValue(new Error("Browser process unavailable"));
+
+    await expect(
+      handleMessage({ type: "SESSION_CLOSE_TARGET", tabId: 404 }, {}),
+    ).rejects.toMatchObject({
+      code: "target_close_failed",
+      details: { tabId: 404, cause: "Browser process unavailable" },
     });
   });
 });
