@@ -176,16 +176,26 @@ async function resolveDefaultTarget(windowId?: number, allowCreate = true): Prom
 }
 
 async function labelSessionTab(tabId: number, name: string): Promise<number | undefined> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    const groupId = await chrome.tabs.group({ tabIds: tabId });
-    await chrome.tabGroups.update(groupId, {
-      title: `Surf: ${name}`,
-      color: "blue",
-      collapsed: false,
-    });
-    return groupId;
+    return await Promise.race([
+      (async () => {
+        const groupId = await chrome.tabs.group({ tabIds: tabId });
+        await chrome.tabGroups.update(groupId, {
+          title: `Surf: ${name}`,
+          color: "blue",
+          collapsed: false,
+        });
+        return groupId;
+      })(),
+      new Promise<undefined>((resolve) => {
+        timer = setTimeout(() => resolve(undefined), 1_000);
+      }),
+    ]);
   } catch {
     return undefined;
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 
@@ -581,8 +591,13 @@ chrome.webNavigation.onCompleted.addListener((details) => {
         type: "TARGET_EVENT",
         event: "navigation",
         tabId: details.tabId,
+        windowId: tab.windowId,
         url: details.url,
         title: tab.title,
+        active: Boolean(tab.active),
+        status: tab.status,
+        restricted: isRestrictedTabUrl(tab.url),
+        groupId: tab.groupId,
       }))
       .catch(() => postToNativeHost({ type: "TARGET_EVENT", event: "navigation", tabId: details.tabId, url: details.url }));
     const resolver = navigationResolvers.get(details.tabId);
@@ -776,8 +791,17 @@ export async function handleMessage(
         throw new BrowserCommandError("target_create_failed", `Failed to create target for session ${name}`);
       }
       const groupId = await labelSessionTab(createdTab.id, name);
-      const inspected = await inspectTarget(createdTab.id);
-      return { ...inspected, mode, groupId };
+      return {
+        tabId: createdTab.id,
+        windowId: createdWindowId,
+        url: createdTab.url || url,
+        title: createdTab.title,
+        active: Boolean(createdTab.active),
+        status: createdTab.status,
+        restricted: isRestrictedTabUrl(createdTab.url || url),
+        mode,
+        groupId,
+      };
     }
 
     case "SESSION_CLOSE_TARGET": {
@@ -2818,7 +2842,8 @@ export async function handleMessage(
       if (!entry) {
         return { error: `Entry not found: ${message.requestId}` };
       }
-      return { entry };
+      const summary = summarizeNetworkEntries([entry], { maxBytes: 30 * 1024, maxEntries: 1 });
+      return { entry: summary.entries[0] };
     }
 
     case "GET_RESPONSE_BODY": {

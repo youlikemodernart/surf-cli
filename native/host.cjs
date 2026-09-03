@@ -425,8 +425,27 @@ function requireBrowserIdentity(timeoutMs = 5000) {
 
 function handleTargetEvent(message) {
   if (!browserIdentity) return;
+  log(`Target event: ${message.event || "unknown"} tabId=${message.tabId ?? "none"}`);
   try {
     if (message.event === "tab-removed" && Number.isInteger(message.tabId)) {
+      // Chrome can emit the authoritative removal event before the async
+      // SESSION_CLOSE_TARGET response. Settle matching cleanup requests from
+      // that event so a closed tab cannot leave release waiting indefinitely.
+      pendingToolRequests.resolveWhere(
+        (entry) =>
+          entry.cleanup === true &&
+          entry.messageType === "SESSION_CLOSE_TARGET" &&
+          entry.tabId === message.tabId,
+        { success: true, tabId: message.tabId, confirmedBy: "tab-removed-event" },
+      );
+      pendingToolRequests.resolveWhere(
+        (entry) => entry.messageType === "TARGET_INSPECT" && entry.tabId === message.tabId,
+        {
+          error: `Tab ${message.tabId} no longer exists`,
+          errorCode: "tab_gone",
+          errorDetails: { tabId: message.tabId, confirmedBy: "tab-removed-event" },
+        },
+      );
       clearTransientFrameContextsByTab(message.tabId);
       browserSessionStore.invalidateByTab(browserIdentity, message.tabId, "tab_gone");
       for (const [streamId, stream] of activeStreams) {
@@ -445,6 +464,22 @@ function handleTargetEvent(message) {
     if ((message.event === "navigation" || message.event === "frame-reset") && Number.isInteger(message.tabId)) {
       clearFrameContextsByTab(message.tabId, message.reason || message.event);
       if (message.event === "frame-reset") return;
+      if (Number.isInteger(message.windowId) && message.windowId > 0) {
+        pendingToolRequests.resolveWhere(
+          (entry) => entry.messageType === "TARGET_INSPECT" && entry.tabId === message.tabId,
+          {
+            tabId: message.tabId,
+            windowId: message.windowId,
+            url: message.url,
+            title: message.title,
+            active: message.active === true,
+            status: message.status,
+            restricted: message.restricted === true,
+            groupId: message.groupId,
+            confirmedBy: "navigation-event",
+          },
+        );
+      }
       const patch = { lastValidatedAt: new Date().toISOString() };
       if (typeof message.url === "string") patch.lastUrl = message.url;
       if (typeof message.title === "string") patch.lastTitle = message.title;
@@ -522,6 +557,8 @@ function requestCallExtension(request, tool, message, timeoutMs = 30000, cleanup
       request,
       cleanup,
       tool,
+      messageType: message.type,
+      tabId: message.tabId,
       resolve: (result) => {
         clearTimeout(timer);
         resolve(result);
@@ -533,6 +570,7 @@ function requestCallExtension(request, tool, message, timeoutMs = 30000, cleanup
     };
     pendingToolRequests.set(id, pending);
     try {
+      log(`Sending to extension: ${message.type || tool} id=${id}`);
       if (cleanup) writeMessage({ ...message, id });
       else sendOwnedExtensionMessage(request, { ...message, id });
     } catch (error) {
@@ -1030,8 +1068,18 @@ async function cleanupBrowserSessions(identity, request, args) {
     });
   }
 
+  const applied = [];
   if (!dryRun) {
     for (const operation of operations) {
+      const current = browserSessionStore.get(identity, operation.record.name);
+      if (!releaseIdentityMatches(current, operation.record)) {
+        retained.push(cleanupEntry(current || operation.record, {
+          reason: "binding-changed",
+          targetAction: "kept",
+          expectedBindingId: operation.record.bindingId,
+        }));
+        continue;
+      }
       if (operation.closeTarget) {
         try {
           const result = await requestExtensionOrThrow(request, "session.cleanup", {
@@ -1050,7 +1098,22 @@ async function cleanupBrowserSessions(identity, request, args) {
           operation.entry.reason = "target-gone";
         }
       }
-      browserSessionStore.remove(identity, operation.record.name);
+      const removal = browserSessionStore.compareAndRemove(
+        identity,
+        operation.record.name,
+        operation.record,
+      );
+      if (removal.outcome !== "removed") {
+        const replacement = browserSessionStore.get(identity, operation.record.name);
+        retained.push(cleanupEntry(replacement || operation.record, {
+          reason: "binding-changed",
+          targetAction: "kept",
+          expectedBindingId: operation.record.bindingId,
+          oldTargetClosed: operation.entry.targetClosed === true,
+        }));
+        continue;
+      }
+      applied.push(operation);
     }
   }
 
@@ -1061,7 +1124,7 @@ async function cleanupBrowserSessions(identity, request, args) {
     idleAfterMs,
     scanned: records.length,
     inspected,
-    removed: operations.map(({ entry }) => entry),
+    removed: (dryRun ? operations : applied).map(({ entry }) => entry),
     retained,
   };
 }

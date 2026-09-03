@@ -7,6 +7,11 @@ const cdpState = vi.hoisted(() => ({
   disableNetworkTracking: vi.fn(),
   drainNetworkEvents: vi.fn(),
   getNetworkEntries: vi.fn(() => cdpState.entries),
+  getNetworkEntry: vi.fn(
+    (_tabId: number, requestId: string) =>
+      cdpState.entries.find((entry) => entry._requestId === requestId || entry.id === requestId) ??
+      null,
+  ),
 }));
 
 vi.mock("../../../src/cdp/controller", () => ({
@@ -15,6 +20,7 @@ vi.mock("../../../src/cdp/controller", () => ({
     disableNetworkTracking = cdpState.disableNetworkTracking;
     drainNetworkEvents = cdpState.drainNetworkEvents;
     getNetworkEntries = cdpState.getNetworkEntries;
+    getNetworkEntry = cdpState.getNetworkEntry;
   },
 }));
 
@@ -38,6 +44,60 @@ describe("network export handlers", () => {
     cdpState.disableNetworkTracking.mockReset();
     cdpState.drainNetworkEvents.mockReset();
     cdpState.getNetworkEntries.mockClear();
+    cdpState.getNetworkEntry.mockClear();
+  });
+
+  it("returns only a redacted summary for network.get", async () => {
+    const handleMessage = await loadHandleMessage();
+    cdpState.entries = [
+      {
+        id: "r-secret",
+        _requestId: "cdp-secret",
+        ts: 1,
+        method: "POST",
+        url: "https://example.test/reset/path-token?SECRET_NAME=query-token#fragment-token",
+        origin: "https://example.test",
+        requestHeaders: { Authorization: "Bearer header-token", Cookie: "session=cookie-token" },
+        requestBody: "request-body-token",
+        responseHeaders: { "set-cookie": "response-cookie-token" },
+        responseBody: "response-body-token",
+        responseBodySize: 19,
+        bodyCapture: { mode: "text", complete: true, capturedBytes: 19 },
+        tabId: 42,
+        type: "XHR",
+        status: 200,
+        flags: [],
+      },
+    ];
+
+    const result = await handleMessage(
+      { type: "GET_NETWORK_ENTRY", tabId: 42, requestId: "r-secret" },
+      {},
+    );
+    const serialized = JSON.stringify(result);
+    expect(result.entry).toMatchObject({
+      id: "r-secret",
+      url: "https://example.test/<redacted-path>?<redacted-query>#<redacted-fragment>",
+    });
+    for (const secret of [
+      "path-token",
+      "SECRET_NAME",
+      "query-token",
+      "fragment-token",
+      "header-token",
+      "cookie-token",
+      "request-body-token",
+      "response-cookie-token",
+      "response-body-token",
+      "Authorization",
+      "requestHeaders",
+      "responseHeaders",
+      "requestBody",
+      '"responseBody"',
+      "cdp-secret",
+    ]) {
+      expect(serialized).not.toContain(secret);
+    }
   });
 
   it("uses bounded summaries even when legacy callers omit full", async () => {

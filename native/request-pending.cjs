@@ -116,6 +116,16 @@ class RequestPendingMap extends Map {
     return true;
   }
 
+  resolveWhere(predicate, valueForEntry) {
+    let resolved = 0;
+    for (const [id, entry] of [...this.entries()]) {
+      if (!predicate(entry)) continue;
+      const value = typeof valueForEntry === "function" ? valueForEntry(entry) : valueForEntry;
+      if (this.resolve(id, value)) resolved += 1;
+    }
+    return resolved;
+  }
+
   tombstoneAfterAbort(request) {
     if (!request?.pendingEntries) return;
     for (const entry of request.pendingEntries) {

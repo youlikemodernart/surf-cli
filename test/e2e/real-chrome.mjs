@@ -413,9 +413,16 @@ try {
   if (replacementReleased.outcome !== "released") throw new Error(`replacement release failed: ${JSON.stringify(replacementReleased)}`);
 
   const adoptSeedResult = JSON.parse(await runSurf("session.ensure", "real-chrome-adopted", "about:blank", "--tab", "--json"));
-  const adoptSeedPage = (await browser.pages()).find((page) => page.url() === "about:blank");
-  if (!adoptSeedPage) throw new Error("adopted-session seed page was absent");
-  await adoptSeedPage.close();
+  const adoptSeedTabId = adoptSeedResult.session?.tabId;
+  if (!Number.isInteger(adoptSeedTabId)) throw new Error("adopted-session seed tab identity was absent");
+  await worker.evaluate(async (tabId) => chrome.tabs.remove(tabId), adoptSeedTabId);
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  const closedSeed = JSON.parse(
+    await runSurf("session.info", "real-chrome-adopted", "--refresh", "--json"),
+  );
+  if (closedSeed.session?.status !== "tab_gone") {
+    throw new Error(`closed seed session did not settle before rebind: ${JSON.stringify(closedSeed)}`);
+  }
   const adoptedResult = JSON.parse(await runSurf(
     "session.rebind", "real-chrome-adopted", "--tab-id", String(fixtureTab.id), "--replace", "--json",
   ));
@@ -446,6 +453,15 @@ try {
 }
 
 const cleanupErrors = [];
+let hostLogOnFailure = "";
+if (failure) {
+  try {
+    const hostLogPath = join(surfTmp, "surf-host.log");
+    if (existsSync(hostLogPath)) hostLogOnFailure = readFileSync(hostLogPath, "utf8");
+  } catch (error) {
+    cleanupErrors.push(error);
+  }
+}
 try {
   if (browser) await browser.close();
 } catch (error) {
@@ -486,6 +502,10 @@ try {
 
 if (failure) {
   console.error("Earliest-landmark receipt:", JSON.stringify(landmarks));
+  if (hostLogOnFailure) {
+    const boundedHostLog = hostLogOnFailure.split("\n").slice(-80).join("\n");
+    console.error("Bounded synthetic host log:\n", boundedHostLog);
+  }
   for (const cleanupError of cleanupErrors) console.error("Cleanup error:", cleanupError);
   throw failure;
 }

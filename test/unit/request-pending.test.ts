@@ -5,6 +5,7 @@ const { RequestPendingMap } = require("../../native/request-pending.cjs") as {
     set(id: number, data: Record<string, unknown>): unknown;
     get(id: number): Record<string, unknown> | undefined;
     resolve(id: number, value: unknown): boolean;
+    resolveWhere(predicate: (entry: Record<string, unknown>) => boolean, value: unknown): number;
     hardDeadline(request: Record<string, unknown>): void;
     expire(id: number, error: Error): boolean;
     onDrain(request: Record<string, unknown>, callback: () => void): void;
@@ -61,6 +62,61 @@ describe("request-owned pending operations", () => {
     pending.resolve(1, { closed: true });
     expect(resolve).toHaveBeenCalledWith({ closed: true });
     expect(owner.pendingEntries.size).toBe(0);
+  });
+
+  it("settles only matching cleanup entries from an authoritative event", () => {
+    const pending = new RequestPendingMap();
+    const owner = request();
+    const matching = vi.fn();
+    const unrelated = vi.fn();
+    pending.set(1, {
+      request: owner,
+      cleanup: true,
+      messageType: "SESSION_CLOSE_TARGET",
+      tabId: 42,
+      resolve: matching,
+    });
+    pending.set(2, {
+      request: owner,
+      cleanup: true,
+      messageType: "SESSION_CLOSE_TARGET",
+      tabId: 43,
+      resolve: unrelated,
+    });
+
+    expect(
+      pending.resolveWhere(
+        (entry) => entry.messageType === "SESSION_CLOSE_TARGET" && entry.tabId === 42,
+        { success: true, tabId: 42, confirmedBy: "tab-removed-event" },
+      ),
+    ).toBe(1);
+    expect(matching).toHaveBeenCalledWith({
+      success: true,
+      tabId: 42,
+      confirmedBy: "tab-removed-event",
+    });
+    expect(unrelated).not.toHaveBeenCalled();
+    expect(pending.get(2)).toBeDefined();
+
+    const inspect = vi.fn();
+    pending.set(3, {
+      request: owner,
+      messageType: "TARGET_INSPECT",
+      tabId: 42,
+      resolve: inspect,
+    });
+    const tabGone = {
+      error: "Tab 42 no longer exists",
+      errorCode: "tab_gone",
+      errorDetails: { tabId: 42, confirmedBy: "tab-removed-event" },
+    };
+    expect(
+      pending.resolveWhere(
+        (entry) => entry.messageType === "TARGET_INSPECT" && entry.tabId === 42,
+        tabGone,
+      ),
+    ).toBe(1);
+    expect(inspect).toHaveBeenCalledWith(tabGone);
   });
 
   it("drains only after every tombstone and cleanup entry settles", () => {
